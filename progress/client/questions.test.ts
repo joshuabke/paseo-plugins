@@ -43,7 +43,7 @@ function renderQuestion(question: Record<string, unknown>, platform = "web", age
     react: {
       ...React,
       useContext: () => ({ locale: "en", messages }),
-      useState: (initial: unknown) => [initial, () => {}],
+      useState: (initial: unknown) => [typeof initial === "function" ? initial() : initial, () => {}],
       useRef: (initial: unknown) => ({ current: initial }),
       useEffect() {},
     },

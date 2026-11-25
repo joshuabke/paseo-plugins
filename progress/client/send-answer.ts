@@ -11,7 +11,13 @@ export function answerMessage(question: Pick<Question, "id">, letter: string): s
   return /^Q\d{1,6}$/.test(question.id) && /^[A-Z]$/.test(letter) ? `${question.id} ${letter}` : null;
 }
 
-// The choice sent per question. It outlives the popover and the dialog, which
+// The user's own words, which do go out as typed. The reference in front keeps
+// them from reading as a slash command.
+export function ownAnswerMessage(question: Pick<Question, "id">, words: string): string | null {
+  return /^Q\d{1,6}$/.test(question.id) && words.trim() ? `${question.id}: ${words.trim()}` : null;
+}
+
+// The message last sent per question. It outlives the popover and the dialog, which
 // close on send while the question stays open until the agent records it.
 const sent = new Map<string, string>();
 
@@ -19,24 +25,23 @@ function sentKey(workspaceId: string, question: Question): string {
   return `${workspaceId}:${question.askedAt}:${question.id}`;
 }
 
-export function sentChoice(workspaceId: string, question: Question): string | undefined {
+export function sentMessage(workspaceId: string, question: Question): string | undefined {
   return sent.get(sentKey(workspaceId, question));
 }
 
-// Sends a choice to the agent that asked. Whether the agent can take it is
+// Sends an answer to the agent that asked, and says whether it went out. Whether the agent can take it is
 // checked on the press: Paseo would bring an archived agent back, and would
 // drop a permission request the agent is waiting on.
 export function useSendAnswer(workspaceId: string) {
   const { messages: m } = useProgressLanguage();
   const toast = useToast();
   const paseo = usePaseo();
-  return async function send(question: Question, letter: string): Promise<void> {
-    const message = answerMessage(question, letter);
+  return async function send(question: Question, message: string): Promise<boolean> {
     const key = sentKey(workspaceId, question);
-    if (!message || !question.agentId || sent.get(key) === letter) return;
+    if (!question.agentId || sent.get(key) === message) return false;
     const before = sent.get(key);
     // Set first, so a second press can't send twice.
-    sent.set(key, letter);
+    sent.set(key, message);
     const undo = () => {
       if (before === undefined) sent.delete(key);
       else sent.set(key, before);
@@ -47,19 +52,21 @@ export function useSendAnswer(workspaceId: string) {
       if (!found || agent.archivedAt || agent.workspaceId !== workspaceId) {
         undo();
         toast.error(m.sendAgentGone(question.id));
-        return;
+        return false;
       }
       if (agent.pendingPermissions?.length) {
         undo();
         toast.error(m.sendNeedsPermission(question.id));
-        return;
+        return false;
       }
       // Joins a running turn instead of interrupting it, where the provider can.
       await agent.send(message, { activeTurnBehavior: "steer" });
-      toast.show(m.sentChoice(question.id, letter), { variant: "success" });
+      toast.show(m.sentAnswer(question.id), { variant: "success" });
+      return true;
     } catch {
       undo();
       toast.error(m.sendFailure(question.id));
+      return false;
     }
   };
 }

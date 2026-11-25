@@ -50,6 +50,10 @@ export interface ProgressMessages {
   questions: string;
   copyFailure: string;
   choiceSent: string;
+  ownAnswerHint: string;
+  youSent: string;
+  send: string;
+  copy: string;
   changedCourse: string;
   answerRecorded: string;
   buildingWith: string;
@@ -180,7 +184,11 @@ export interface ProgressMessages {
   copyChoiceForAgent: (id: string, letter: string) => string;
   sendChoice: (id: string, letter: string) => string;
   sendChoiceToAgent: (id: string, letter: string) => string;
-  sentChoice: (id: string, letter: string) => string;
+  choiceWasSent: (id: string, letter: string) => string;
+  sentAnswer: (id: string) => string;
+  ownAnswer: (id: string) => string;
+  sendOwnAnswer: (id: string) => string;
+  copyOwnAnswer: (id: string) => string;
   sendFailure: (id: string) => string;
   sendAgentGone: (id: string) => string;
   sendNeedsPermission: (id: string) => string;

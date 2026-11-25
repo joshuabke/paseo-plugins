@@ -7,7 +7,9 @@ import { AttachmentList, type Attachment, questionAttachments } from "./attachme
 import { PressableRow } from "./row";
 import { ShowMoreRow, usePaged } from "./show-more";
 import { PressScale } from "./motion";
-import { answerMessage, sentChoice, useSendAnswer } from "./send-answer";
+import { answerMessage, sentMessage, useSendAnswer } from "./send-answer";
+import { AnswerButton, type ButtonFill } from "./answer-button";
+import { OwnAnswer } from "./own-answer";
 import { StackedDialog } from "./dialog-stack";
 import { raised } from "./surfaces";
 import { When } from "./when";
@@ -19,18 +21,19 @@ export function replyPrefix(question: Pick<Question, "id" | "title">): string {
   return `${question.id} (${question.title}): `;
 }
 
-// What the Copy button on an option puts on the clipboard, ready to paste.
-export function replyWithChoice(question: Pick<Question, "id" | "title">, letter: string): string {
-  return `${replyPrefix(question)}${letter}`;
+// What Copy puts on the clipboard, ready to paste: a choice, or the user's own words.
+export function replyWithChoice(question: Pick<Question, "id" | "title">, answer: string): string {
+  return `${replyPrefix(question)}${answer}`;
 }
 
 export function useCopy() {
   const { messages: m } = useProgressLanguage();
   const toast = useToast();
-  return async function copy(question: Question, letter?: string) {
+  return async function copy(question: Question, answer?: string) {
+    const choice = question.options.some((option) => option.letter === answer);
     try {
-      await copyText(letter ? replyWithChoice(question, letter) : replyPrefix(question));
-      toast.show(letter ? m.copiedChoice(question.id, letter) : m.copiedQuestion(question.id), { variant: "success" });
+      await copyText(answer ? replyWithChoice(question, answer) : replyPrefix(question));
+      toast.show(answer && choice ? m.copiedChoice(question.id, answer) : m.copiedQuestion(question.id), { variant: "success" });
     } catch {
       toast.error(m.copyFailure);
     }
@@ -248,7 +251,7 @@ export function QuestionView({
   // The worktree root the attachments' paths are relative to.
   root: string;
   workspaceId: string;
-  onCopy(letter: string): void;
+  onCopy(answer: string): void;
   onSent(): void;
   onOpenAttachment(attachment: Attachment, group: Attachment[]): void;
   children?: React.ReactNode;
@@ -336,7 +339,7 @@ export function QuestionDetail({
   now: number;
   root: string;
   workspaceId: string;
-  onCopy(letter: string): void;
+  onCopy(answer: string): void;
   // A choice went out to the agent that asked.
   onSent(): void;
   onOpenAttachment(attachment: Attachment, group: Attachment[]): void;
@@ -384,6 +387,7 @@ export function QuestionDetail({
           </View>
         );
       })}
+      {!question.answer ? <OwnAnswer colors={colors} button={button} question={question} workspaceId={workspaceId} onCopy={onCopy} onSent={onSent} /> : null}
       {question.background ? <Markdown>{question.background}</Markdown> : null}
       <AttachmentList colors={colors} attachments={questionAttachments(question)} root={root} onOpen={onOpenAttachment} />
       <Text style={{ color: colors.foregroundMuted, fontSize: 11, lineHeight: 16 }}>
@@ -397,7 +401,7 @@ export function QuestionDetail({
 
 type AnswerButtonsProps = {
   colors: Colors;
-  button: { rest: string; pressed: string };
+  button: ButtonFill;
   question: Question;
   letter: string;
   workspaceId: string;
@@ -408,11 +412,12 @@ type AnswerButtonsProps = {
 // Send when the agent that asked can be reached from Paseo, Copy otherwise.
 function AnswerButtons(props: AnswerButtonsProps) {
   const { question, letter } = props;
-  if (question.agentId && answerMessage(question, letter)) return <SendOrCopy {...props} agentId={question.agentId} />;
+  const message = answerMessage(question, letter);
+  if (question.agentId && message) return <SendOrCopy {...props} agentId={question.agentId} message={message} />;
   return <CopyChoice {...props} />;
 }
 
-function SendOrCopy({ agentId, ...props }: AnswerButtonsProps & { agentId: string }) {
+function SendOrCopy({ agentId, message, ...props }: AnswerButtonsProps & { agentId: string; message: string }) {
   const { colors, button, question, letter, workspaceId, onSent } = props;
   const { messages: m } = useProgressLanguage();
   const send = useSendAnswer(workspaceId);
@@ -420,7 +425,7 @@ function SendOrCopy({ agentId, ...props }: AnswerButtonsProps & { agentId: strin
   // another workspace's agent has no business with this answer.
   const here = useAgent(agentId, (agent) => agent.workspaceId === workspaceId);
   if (!here) return <CopyChoice {...props} />;
-  const alreadySent = sentChoice(workspaceId, question) === letter;
+  const alreadySent = sentMessage(workspaceId, question) === message;
   return (
     <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
       <AnswerButton
@@ -428,10 +433,10 @@ function SendOrCopy({ agentId, ...props }: AnswerButtonsProps & { agentId: strin
         button={button}
         icon={alreadySent ? "Check" : "Send"}
         label={alreadySent ? m.choiceSent : m.sendChoice(question.id, letter)}
-        accessibilityLabel={alreadySent ? m.sentChoice(question.id, letter) : m.sendChoiceToAgent(question.id, letter)}
+        accessibilityLabel={alreadySent ? m.choiceWasSent(question.id, letter) : m.sendChoiceToAgent(question.id, letter)}
         disabled={alreadySent}
         onPress={() => {
-          void send(question, letter);
+          void send(question, message);
           onSent();
         }}
       />
@@ -451,48 +456,5 @@ function CopyChoice({ colors, button, question, letter, onCopy, iconOnly = false
       accessibilityLabel={m.copyChoiceForAgent(question.id, letter)}
       onPress={onCopy}
     />
-  );
-}
-
-function AnswerButton({
-  colors,
-  button,
-  icon,
-  label,
-  accessibilityLabel,
-  disabled = false,
-  onPress,
-}: {
-  colors: Colors;
-  button: { rest: string; pressed: string };
-  icon: "Check" | "Copy" | "Send";
-  label?: string;
-  accessibilityLabel: string;
-  disabled?: boolean;
-  onPress(): void;
-}) {
-  return (
-    <PressScale
-      accessibilityRole="button"
-      accessibilityLabel={accessibilityLabel}
-      disabled={disabled}
-      onPress={disabled ? undefined : onPress}
-      hitSlop={4}
-      style={({ pressed }) => ({
-        flexDirection: "row",
-        alignItems: "center",
-        gap: 4,
-        paddingLeft: 6,
-        paddingRight: label ? 8 : 6,
-        paddingVertical: label ? 3 : 5,
-        borderRadius: 4,
-        opacity: disabled ? 0.6 : 1,
-        ...raised(colors),
-        backgroundColor: pressed ? button.pressed : button.rest,
-      })}
-    >
-      <Icon name={icon} size={12} color={colors.foreground} />
-      {label ? <Text style={{ color: colors.foreground, fontSize: 12, lineHeight: 16 }}>{label}</Text> : null}
-    </PressScale>
   );
 }
