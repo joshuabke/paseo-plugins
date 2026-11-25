@@ -47,8 +47,9 @@ function renderQuestion(question: Record<string, unknown>, platform = "web", age
       useRef: (initial: unknown) => ({ current: initial }),
       useEffect() {},
     },
+    "@tanstack/react-query": { useQueryClient: () => ({}) },
     "@getpaseo/plugin/client": {
-      usePaseo: () => ({}),
+      useRpc: () => async () => ({}),
       useAgent: (_id: string, select: (snapshot: unknown) => unknown) => (agent ? select(agent) : null),
     },
     "react-native": {
@@ -153,6 +154,15 @@ test("without an agent to send to, a choice has only Copy", () => {
   assert.deepEqual(buttons(renderQuestion({ ...question, id: "Q1 now push", agentId: "a1" }, "web", { workspaceId: "w" })), [
     "Copy Q1 now push A for your agent",
   ]);
+});
+
+const choiceState = (given: string) =>
+  buttons(renderQuestion({ ...question, agentId: "a1", given: { answer: { choice: "A" }, state: given } }, "web", { workspaceId: "w" }));
+
+test("a choice that went out or waits can't be pressed again, and one held back can", () => {
+  assert.deepEqual(choiceState("sent"), ["Q1 A: Sent", COPY]);
+  assert.deepEqual(choiceState("queued"), ["Q1 A: Queued", COPY, "Send your answer to Q1 now", "Discard your answer to Q1"]);
+  assert.deepEqual(choiceState("held"), [SEND, COPY, "Send your answer to Q1 now", "Discard your answer to Q1"]);
 });
 
 test("an answered question has no Send or Copy", () => {

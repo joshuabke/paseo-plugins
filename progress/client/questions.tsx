@@ -2,12 +2,13 @@ import { type PluginWorkspacePanelProps, useAgent } from "@getpaseo/plugin/clien
 import { copyText, Icon, Markdown, useToast } from "@getpaseo/plugin/client/ui";
 import React, { useState } from "react";
 import { Text, View } from "react-native";
+import { answerMessage, sameAnswer } from "../shared/answers";
 import type { Question } from "../shared/dashboard";
 import { AttachmentList, type Attachment, questionAttachments } from "./attachments";
 import { PressableRow } from "./row";
 import { ShowMoreRow, usePaged } from "./show-more";
 import { PressScale } from "./motion";
-import { answerMessage, sentMessage, useSendAnswer } from "./send-answer";
+import { useSendAnswer } from "./send-answer";
 import { AnswerButton, type ButtonFill } from "./answer-button";
 import { OwnAnswer } from "./own-answer";
 import { StackedDialog } from "./dialog-stack";
@@ -380,6 +381,7 @@ export function QuestionDetail({
                 question={question}
                 letter={option.letter}
                 workspaceId={workspaceId}
+                root={root}
                 onCopy={() => onCopy(option.letter)}
                 onSent={onSent}
               />
@@ -387,7 +389,9 @@ export function QuestionDetail({
           </View>
         );
       })}
-      {!question.answer ? <OwnAnswer colors={colors} button={button} question={question} workspaceId={workspaceId} onCopy={onCopy} onSent={onSent} /> : null}
+      {!question.answer ? (
+        <OwnAnswer colors={colors} button={button} question={question} workspaceId={workspaceId} root={root} onCopy={onCopy} onSent={onSent} />
+      ) : null}
       {question.background ? <Markdown>{question.background}</Markdown> : null}
       <AttachmentList colors={colors} attachments={questionAttachments(question)} root={root} onOpen={onOpenAttachment} />
       <Text style={{ color: colors.foregroundMuted, fontSize: 11, lineHeight: 16 }}>
@@ -405,6 +409,7 @@ type AnswerButtonsProps = {
   question: Question;
   letter: string;
   workspaceId: string;
+  root: string;
   onCopy(): void;
   onSent(): void;
 };
@@ -412,31 +417,32 @@ type AnswerButtonsProps = {
 // Send when the agent that asked can be reached from Paseo, Copy otherwise.
 function AnswerButtons(props: AnswerButtonsProps) {
   const { question, letter } = props;
-  const message = answerMessage(question, letter);
-  if (question.agentId && message) return <SendOrCopy {...props} agentId={question.agentId} message={message} />;
+  if (question.agentId && answerMessage(question, { choice: letter })) return <SendOrCopy {...props} agentId={question.agentId} />;
   return <CopyChoice {...props} />;
 }
 
-function SendOrCopy({ agentId, message, ...props }: AnswerButtonsProps & { agentId: string; message: string }) {
-  const { colors, button, question, letter, workspaceId, onSent } = props;
+function SendOrCopy({ agentId, ...props }: AnswerButtonsProps & { agentId: string }) {
+  const { colors, button, question, letter, workspaceId, root, onSent } = props;
   const { messages: m } = useProgressLanguage();
-  const send = useSendAnswer(workspaceId);
+  const { send } = useSendAnswer({ workspaceId, root });
   // Only an agent in this workspace: the progress file names the agent, and
   // another workspace's agent has no business with this answer.
   const here = useAgent(agentId, (agent) => agent.workspaceId === workspaceId);
   if (!here) return <CopyChoice {...props} />;
-  const alreadySent = sentMessage(workspaceId, question) === message;
+  const given = question.given && sameAnswer(question.given.answer, { choice: letter }) ? question.given.state : undefined;
+  const done = given === "sent" || given === "queued";
+  const label = given === "sent" ? m.choiceSent : given === "queued" ? m.choiceQueued : m.sendChoice(question.id, letter);
   return (
     <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
       <AnswerButton
         colors={colors}
         button={button}
-        icon={alreadySent ? "Check" : "Send"}
-        label={alreadySent ? m.choiceSent : m.sendChoice(question.id, letter)}
-        accessibilityLabel={alreadySent ? m.choiceWasSent(question.id, letter) : m.sendChoiceToAgent(question.id, letter)}
-        disabled={alreadySent}
+        icon={given === "sent" ? "Check" : given === "queued" ? "Clock" : "Send"}
+        label={label}
+        accessibilityLabel={done ? `${question.id} ${letter}${m.colon}${label}` : m.sendChoiceToAgent(question.id, letter)}
+        disabled={done}
         onPress={() => {
-          void send(question, message);
+          void send(question, { choice: letter });
           onSent();
         }}
       />

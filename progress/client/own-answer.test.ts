@@ -27,6 +27,7 @@ function field({
   platform = "web",
   agent = { workspaceId: "w" } as { workspaceId: string } | null,
   fails = false,
+  result = "sent",
   asked = question as Record<string, unknown>,
 } = {}) {
   let messages: unknown;
@@ -35,17 +36,12 @@ function field({
   const sends: string[] = [];
   const copied: string[] = [];
   const log: string[] = [];
-  const paseo = {
-    agents: {
-      ref: () => ({
-        workspaceId: "w",
-        refresh: async () => ({}),
-        async send(text: string) {
-          if (fails) throw new Error("offline");
-          sends.push(text);
-        },
-      }),
-    },
+  const requests: Array<{ name: string; input: Record<string, any> }> = [];
+  const useRpc = (contract: { name: string }) => async (input: Record<string, any>) => {
+    requests.push({ name: contract.name, input });
+    if (fails) throw new Error("offline");
+    if (contract.name === "progress.answer.send") sends.push("words" in input.answer ? input.answer.words : input.answer.choice);
+    return { result };
   };
   // A textarea and the browser's editing command, as far as the field uses them.
   const area = {
@@ -88,9 +84,10 @@ function field({
       Animated: { Value: AnimatedValue, timing: () => ({ start() {} }), View: "View" },
     },
     "@getpaseo/plugin/client": {
-      usePaseo: () => paseo,
+      useRpc,
       useAgent: (_id: string, select: (snapshot: unknown) => unknown) => (agent ? select(agent) : null),
     },
+    "@tanstack/react-query": { useQueryClient: () => ({ invalidateQueries() {} }) },
     "@getpaseo/plugin/client/ui": { TextInput: "TextInput", Icon: () => null, useToast: () => ({ show() {}, error() {} }) },
   });
   messages = h.load("client/i18n.ts").messagesFor("en");
@@ -104,13 +101,17 @@ function field({
         button: { rest: "", pressed: "" },
         question: asked,
         workspaceId: "w",
+        root: "/repo",
         onCopy: (answer: string) => copied.push(answer),
         onSent: () => closed++,
       }),
     );
+    const buttons = tree.flatMap((element) => (element.props.accessibilityLabel && element.type === "Pressable" ? [element.props.accessibilityLabel] : []));
     const press = (label: string) => tree.find((element) => element.props.accessibilityLabel === label)?.props.onPress;
     return {
       input: tree.find((element) => element.type === "TextInput")!.props,
+      buttons: [...new Set(buttons)],
+      press,
       send: press("Send your own answer to Q2 to your agent"),
       copy: press("Copy your own answer to Q2 for your agent"),
       texts: tree.filter((element) => element.type === "Text").map((element) => [element.props.children].flat().join("")),
@@ -119,6 +120,7 @@ function field({
   return {
     render,
     sends,
+    requests,
     copied,
     log,
     area,
@@ -142,17 +144,64 @@ function field({
 
 const settled = () => new Promise((resolve) => setImmediate(resolve));
 
-test("the user's own answer goes to the agent, and the field shows what was sent", async () => {
+test("the user's own answer goes to the server for the question it's about", async () => {
   const f = field();
   assert.equal(f.render().send, undefined, "nothing written, nothing to send");
   f.type("Bigger, please");
   f.render().send();
   await settled();
-  assert.deepEqual(f.sends, ["Q2: Bigger, please"]);
+  assert.deepEqual(JSON.parse(JSON.stringify(f.requests)), [
+    {
+      name: "progress.answer.send",
+      input: { workspaceId: "w", workspaceDirectory: "/repo", questionId: "Q2", askedAt: question.askedAt, answer: { words: "Bigger, please" }, now: false },
+    },
+  ]);
   assert.equal(f.closed(), 1);
-  const view = f.reopen();
-  assert.equal(view.input.value, "");
-  assert.ok(view.texts.includes("You sent: Bigger, please"), JSON.stringify(view.texts));
+  assert.equal(f.reopen().input.value, "");
+});
+
+test("a draft is kept until the server has the answer", async () => {
+  for (const [result, kept] of [
+    ["sent", ""],
+    ["queued", ""],
+    ["held", ""],
+    ["gone", "Words"],
+    ["closed", "Words"],
+  ]) {
+    const f = field({ result });
+    f.type("Words");
+    f.render().send();
+    await settled();
+    assert.equal(f.reopen().input.value, kept, result);
+  }
+});
+
+const given = (state: string, answer: unknown = { words: "Bigger" }) => ({ asked: { ...question, given: { answer, state } } });
+
+test("an answer that waits can go out now or be discarded; one that went out just shows", async () => {
+  const waits = field(given("queued"));
+  assert.ok(waits.render().texts.some((text) => text.startsWith("Waits for the agent's turn to end: ")));
+  assert.deepEqual(waits.render().buttons, ["Send your answer to Q2 now", "Discard your answer to Q2"]);
+  waits.render().press("Send your answer to Q2 now")();
+  await settled();
+  waits.render().press("Discard your answer to Q2")();
+  await settled();
+  assert.deepEqual(
+    waits.requests.map(({ name, input }) => [name, input.now]),
+    [
+      ["progress.answer.send", true],
+      ["progress.answer.cancel", undefined],
+    ],
+  );
+  assert.ok(
+    field(given("held"))
+      .render()
+      .texts.some((text) => text.startsWith("Not sent yet: ")),
+  );
+  const sent = field(given("sent")).render();
+  assert.ok(sent.texts.some((text) => text.startsWith("You sent: ")));
+  assert.deepEqual(sent.buttons, []);
+  assert.deepEqual(field(given("sent", { choice: "A" })).render().texts, [], "its button says so");
 });
 
 test("a draft survives closing the dialog, and a send that failed", async () => {
@@ -204,7 +253,7 @@ test("Tab moves a list item in, and Cmd or Ctrl+Enter sends", async () => {
   assert.equal(f.render().input.value, "  - one");
   assert.equal(f.key({ key: "Enter", ctrlKey: true }), true);
   await settled();
-  assert.deepEqual(f.sends, ["Q2: - one"]);
+  assert.deepEqual(f.sends, ["  - one"]);
 });
 
 test("on a phone, a typed line break continues the list and moves the cursor", () => {

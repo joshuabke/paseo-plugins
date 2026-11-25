@@ -2,11 +2,12 @@ import { type PluginWorkspacePanelProps, useAgent } from "@getpaseo/plugin/clien
 import { TextInput } from "@getpaseo/plugin/client/ui";
 import React, { useState } from "react";
 import { type NativeSyntheticEvent, Platform, Text, type TextInputKeyPressEventData, View } from "react-native";
+import { answerMessage } from "../shared/answers";
 import type { Question } from "../shared/dashboard";
 import { applyEdit, type Edit, enterEdit, indentEdit, typedBreak } from "../shared/list-edit";
 import { AnswerButton, type ButtonFill } from "./answer-button";
 import { useProgressLanguage } from "./language";
-import { ownAnswerMessage, sentMessage, useSendAnswer } from "./send-answer";
+import { useSendAnswer } from "./send-answer";
 
 type Colors = PluginWorkspacePanelProps["theme"]["colors"];
 
@@ -15,6 +16,8 @@ interface OwnAnswerProps {
   button: ButtonFill;
   question: Question;
   workspaceId: string;
+  // The worktree root, where the question's progress is kept.
+  root: string;
   onCopy(answer: string): void;
   onSent(): void;
 }
@@ -29,23 +32,64 @@ export function OwnAnswer(props: OwnAnswerProps) {
 
 // Send when the agent that asked can be reached from this workspace; see SendOrCopy.
 function OwnAnswerFor({ agentId, ...props }: OwnAnswerProps & { agentId: string }) {
-  const { question, workspaceId, onSent } = props;
-  const send = useSendAnswer(workspaceId);
+  const { question, workspaceId, root, onSent } = props;
+  const { send } = useSendAnswer({ workspaceId, root });
   const here = useAgent(agentId, (agent) => agent.workspaceId === workspaceId);
   if (!here) return <OwnAnswerField {...props} />;
   return (
-    <OwnAnswerField
-      {...props}
-      onSend={(words, clear) => {
-        const message = ownAnswerMessage(question, words);
-        if (!message) return;
-        // Kept until it's out, so a failed send loses nothing.
-        void send(question, message).then((out) => {
-          if (out) clear();
-        });
-        onSent();
-      }}
-    />
+    <>
+      <OwnAnswerField
+        {...props}
+        onSend={(words, clear) => {
+          if (!answerMessage(question, { words })) return;
+          // Kept until it's out, so a failed send loses nothing.
+          void send(question, { words }).then((out) => {
+            if (out) clear();
+          });
+          onSent();
+        }}
+      />
+      <GivenAnswerRow {...props} />
+    </>
+  );
+}
+
+// What became of the answer given: who has it, or what it waits for. A choice
+// that went out already says so on its button.
+function GivenAnswerRow({ colors, button, question, workspaceId, root }: OwnAnswerProps) {
+  const { messages: m } = useProgressLanguage();
+  const { send, cancel } = useSendAnswer({ workspaceId, root });
+  const { given } = question;
+  if (!given || (given.state === "sent" && "choice" in given.answer)) return null;
+  const { answer, state } = given;
+  return (
+    <View style={{ gap: 6 }}>
+      <Text selectable style={{ color: colors.foregroundMuted, fontSize: 12, lineHeight: 17 }}>
+        {state === "queued" ? m.answerQueued : state === "held" ? m.answerHeld : m.youSent}
+        {m.colon}
+        <Text style={{ color: colors.foreground }}>{"words" in answer ? answer.words : `${question.id} ${answer.choice}`}</Text>
+      </Text>
+      {state === "sent" ? null : (
+        <View style={{ flexDirection: "row", justifyContent: "flex-end", alignItems: "center", gap: 6 }}>
+          <AnswerButton
+            colors={colors}
+            button={button}
+            icon="Send"
+            label={m.sendNow}
+            accessibilityLabel={m.sendNowAnswer(question.id)}
+            onPress={() => void send(question, answer, true)}
+          />
+          <AnswerButton
+            colors={colors}
+            button={button}
+            icon="X"
+            label={m.discard}
+            accessibilityLabel={m.discardAnswer(question.id)}
+            onPress={() => void cancel(question)}
+          />
+        </View>
+      )}
+    </View>
   );
 }
 
@@ -56,7 +100,7 @@ function OwnAnswerField({
   workspaceId,
   onCopy,
   onSend,
-}: Omit<OwnAnswerProps, "onSent"> & { onSend?(words: string, clear: () => void): void }) {
+}: Omit<OwnAnswerProps, "onSent" | "root"> & { onSend?(words: string, clear: () => void): void }) {
   const { messages: m } = useProgressLanguage();
   const draftKey = `${workspaceId}:${question.askedAt}:${question.id}`;
   const [words, setWords] = useState(() => drafts.get(draftKey) ?? "");
@@ -77,8 +121,6 @@ function OwnAnswerField({
       if (drafts.get(draftKey) === words) keep("");
     });
   };
-  const sent = sentMessage(workspaceId, question);
-  const ownPrefix = `${question.id}: `;
   return (
     <View style={{ gap: 6 }}>
       <TextInput
@@ -135,12 +177,6 @@ function OwnAnswerField({
             onPress={() => onCopy(words.trim())}
           />
         </View>
-      ) : sent?.startsWith(ownPrefix) ? (
-        <Text numberOfLines={3} style={{ color: colors.foregroundMuted, fontSize: 12, lineHeight: 17 }}>
-          {m.youSent}
-          {m.colon}
-          {sent.slice(ownPrefix.length)}
-        </Text>
       ) : null}
     </View>
   );

@@ -1,72 +1,53 @@
-import { usePaseo } from "@getpaseo/plugin/client";
+import { useRpc } from "@getpaseo/plugin/client";
 import { useToast } from "@getpaseo/plugin/client/ui";
+import { useQueryClient } from "@tanstack/react-query";
+import type { Answer } from "../shared/answers";
 import type { Question } from "../shared/dashboard";
+import { cancelAnswer, sendAnswer } from "../shared/rpc";
 import { useProgressLanguage } from "./language";
 
-// The message Send delivers, like "Q2 B", or null when the question isn't one
-// to send for. It goes out in the user's name, so it never carries words an
-// agent wrote: Copy's "(title)" is left out, and an id or letter that isn't
-// plain is refused.
-export function answerMessage(question: Pick<Question, "id">, letter: string): string | null {
-  return /^Q\d{1,6}$/.test(question.id) && /^[A-Z]$/.test(letter) ? `${question.id} ${letter}` : null;
-}
+// Presses under way, so a second press can't send twice.
+const sending = new Set<string>();
 
-// The user's own words, which do go out as typed. The reference in front keeps
-// them from reading as a slash command.
-export function ownAnswerMessage(question: Pick<Question, "id">, words: string): string | null {
-  return /^Q\d{1,6}$/.test(question.id) && words.trim() ? `${question.id}: ${words.trim()}` : null;
-}
-
-// The message last sent per question. It outlives the popover and the dialog, which
-// close on send while the question stays open until the agent records it.
-const sent = new Map<string, string>();
-
-function sentKey(workspaceId: string, question: Question): string {
-  return `${workspaceId}:${question.askedAt}:${question.id}`;
-}
-
-export function sentMessage(workspaceId: string, question: Question): string | undefined {
-  return sent.get(sentKey(workspaceId, question));
-}
-
-// Sends an answer to the agent that asked, and says whether it went out. Whether the agent can take it is
-// checked on the press: Paseo would bring an archived agent back, and would
-// drop a permission request the agent is waiting on.
-export function useSendAnswer(workspaceId: string) {
+// Gives answers to the agent that asked, through the plugin's server, which
+// holds them while the agent works.
+export function useSendAnswer({ workspaceId, root }: { workspaceId: string; root: string }) {
   const { messages: m } = useProgressLanguage();
   const toast = useToast();
-  const paseo = usePaseo();
-  return async function send(question: Question, message: string): Promise<boolean> {
-    const key = sentKey(workspaceId, question);
-    if (!question.agentId || sent.get(key) === message) return false;
-    const before = sent.get(key);
-    // Set first, so a second press can't send twice.
-    sent.set(key, message);
-    const undo = () => {
-      if (before === undefined) sent.delete(key);
-      else sent.set(key, before);
-    };
-    try {
-      const agent = paseo.agents.ref(question.agentId);
-      const found = await agent.refresh();
-      if (!found || agent.archivedAt || agent.workspaceId !== workspaceId) {
-        undo();
-        toast.error(m.sendAgentGone(question.id));
+  const requestSend = useRpc(sendAnswer);
+  const requestCancel = useRpc(cancelAnswer);
+  const queryClient = useQueryClient();
+  const target = (question: Question) => ({ workspaceId, workspaceDirectory: root, questionId: question.id, askedAt: question.askedAt });
+  const refresh = () => void queryClient.invalidateQueries({ queryKey: ["progress", "dashboard"] });
+  return {
+    // Whether the server has the answer: sent, waiting, or held for another try.
+    async send(question: Question, answer: Answer, now = false): Promise<boolean> {
+      const key = `${workspaceId}:${question.askedAt}:${question.id}`;
+      if (sending.has(key)) return false;
+      sending.add(key);
+      try {
+        const { result } = await requestSend({ ...target(question), answer, now });
+        refresh();
+        if (result === "sent") toast.show(m.sentAnswer(question.id), { variant: "success" });
+        else if (result === "queued") toast.show(m.queuedAnswer(question.id), { variant: "success" });
+        else if (result === "gone") toast.error(m.sendAgentGone(question.id));
+        else if (result === "closed") toast.error(m.sendClosed(question.id));
+        else toast.error(m.heldAnswer(question.id));
+        return result !== "gone" && result !== "closed";
+      } catch {
+        toast.error(m.sendFailure(question.id));
         return false;
+      } finally {
+        sending.delete(key);
       }
-      if (agent.pendingPermissions?.length) {
-        undo();
-        toast.error(m.sendNeedsPermission(question.id));
-        return false;
+    },
+    async cancel(question: Question): Promise<void> {
+      try {
+        await requestCancel(target(question));
+      } catch {
+        toast.error(m.cancelFailure(question.id));
       }
-      // Joins a running turn instead of interrupting it, where the provider can.
-      await agent.send(message, { activeTurnBehavior: "steer" });
-      toast.show(m.sentAnswer(question.id), { variant: "success" });
-      return true;
-    } catch {
-      undo();
-      toast.error(m.sendFailure(question.id));
-      return false;
-    }
+      refresh();
+    },
   };
 }

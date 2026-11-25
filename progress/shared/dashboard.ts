@@ -1,4 +1,5 @@
 import { EVENT_VERSION, eventSchema, type DELIVERABLE_KINDS, type FileLink, type ProgressEvent, type QuestionOption, type TicketStatus } from "./events.ts";
+import type { GivenAnswer } from "./answers.ts";
 import { QUESTION_MODE_RULES, type QuestionState } from "./question-modes.ts";
 
 // One recorded change to a ticket, oldest first. `stage: ""` clears the stage.
@@ -57,6 +58,8 @@ export interface Question {
   // The Paseo agent that asked it, when asked from Paseo.
   agentId?: string;
   askedAt: string;
+  // The user's answer from the dashboard, while the agent hasn't recorded one. Only in what the panel gets.
+  given?: GivenAnswer;
   // `changedCourse`: the agent had built another option and changed course.
   answer?: { choice: string; words?: string; changedCourse?: boolean; at: string };
 }
