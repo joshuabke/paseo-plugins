@@ -54,6 +54,8 @@ export interface Question {
   files: FileLink[];
   raisedBy?: string;
   ticketId?: string;
+  // The Paseo agent that asked it, when asked from Paseo.
+  agentId?: string;
   askedAt: string;
   // `changedCourse`: the agent had built another option and changed course.
   answer?: { choice: string; words?: string; changedCourse?: boolean; at: string };
@@ -317,6 +319,7 @@ export function reduceProgress(
           files: event.files ?? [],
           raisedBy: event.raisedBy,
           ticketId: event.ticket,
+          agentId: event.by,
           askedAt: event.ts,
         });
         break;

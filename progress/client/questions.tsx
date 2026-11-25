@@ -1,4 +1,4 @@
-import type { PluginWorkspacePanelProps } from "@getpaseo/plugin/client";
+import { type PluginWorkspacePanelProps, useAgent } from "@getpaseo/plugin/client";
 import { copyText, Icon, Markdown, useToast } from "@getpaseo/plugin/client/ui";
 import React, { useState } from "react";
 import { Text, View } from "react-native";
@@ -7,6 +7,7 @@ import { AttachmentList, type Attachment, questionAttachments } from "./attachme
 import { PressableRow } from "./row";
 import { ShowMoreRow, usePaged } from "./show-more";
 import { PressScale } from "./motion";
+import { answerMessage, sentChoice, useSendAnswer } from "./send-answer";
 import { StackedDialog } from "./dialog-stack";
 import { raised } from "./surfaces";
 import { When } from "./when";
@@ -235,7 +236,9 @@ export function QuestionView({
   question,
   now,
   root,
+  workspaceId,
   onCopy,
+  onSent,
   onOpenAttachment,
   children,
 }: {
@@ -244,7 +247,9 @@ export function QuestionView({
   now: number;
   // The worktree root the attachments' paths are relative to.
   root: string;
+  workspaceId: string;
   onCopy(letter: string): void;
+  onSent(): void;
   onOpenAttachment(attachment: Attachment, group: Attachment[]): void;
   children?: React.ReactNode;
 }) {
@@ -255,7 +260,17 @@ export function QuestionView({
         {!question.answer ? <QuestionState colors={colors} question={question} /> : null}
       </View>
       {question.answer ? <AnswerSummary colors={colors} question={question} now={now} /> : null}
-      <QuestionDetail colors={colors} question={question} now={now} root={root} onSurface1 onCopy={onCopy} onOpenAttachment={onOpenAttachment} />
+      <QuestionDetail
+        colors={colors}
+        question={question}
+        now={now}
+        root={root}
+        workspaceId={workspaceId}
+        onSurface1
+        onCopy={onCopy}
+        onSent={onSent}
+        onOpenAttachment={onOpenAttachment}
+      />
       {children}
     </View>
   );
@@ -304,13 +319,15 @@ export function QuestionState({ colors, question }: { colors: Colors; question: 
 }
 
 // `onSurface1` when drawn on a surface1 background (Paseo's dialogs), so the
-// Copy buttons still stand off it.
+// Send and Copy buttons still stand off it.
 export function QuestionDetail({
   colors,
   question,
   now,
   root,
+  workspaceId,
   onCopy,
+  onSent,
   onOpenAttachment,
   onSurface1 = false,
 }: {
@@ -318,7 +335,10 @@ export function QuestionDetail({
   question: Question;
   now: number;
   root: string;
+  workspaceId: string;
   onCopy(letter: string): void;
+  // A choice went out to the agent that asked.
+  onSent(): void;
   onOpenAttachment(attachment: Attachment, group: Attachment[]): void;
   onSurface1?: boolean;
 }) {
@@ -351,26 +371,15 @@ export function QuestionDetail({
               ) : null}
             </View>
             {!question.answer ? (
-              <PressScale
-                accessibilityRole="button"
-                accessibilityLabel={m.copyChoiceForAgent(question.id, option.letter)}
-                onPress={() => onCopy(option.letter)}
-                hitSlop={4}
-                style={({ pressed }) => ({
-                  flexDirection: "row",
-                  alignItems: "center",
-                  gap: 4,
-                  paddingLeft: 6,
-                  paddingRight: 8,
-                  paddingVertical: 3,
-                  borderRadius: 4,
-                  ...raised(colors),
-                  backgroundColor: pressed ? button.pressed : button.rest,
-                })}
-              >
-                <Icon name="Copy" size={12} color={colors.foreground} />
-                <Text style={{ color: colors.foreground, fontSize: 12, lineHeight: 16 }}>{m.copyChoice(question.id, option.letter)}</Text>
-              </PressScale>
+              <AnswerButtons
+                colors={colors}
+                button={button}
+                question={question}
+                letter={option.letter}
+                workspaceId={workspaceId}
+                onCopy={() => onCopy(option.letter)}
+                onSent={onSent}
+              />
             ) : null}
           </View>
         );
@@ -383,5 +392,107 @@ export function QuestionDetail({
         {question.raisedBy ? m.raisedBy(question.raisedBy) : ""}
       </Text>
     </View>
+  );
+}
+
+type AnswerButtonsProps = {
+  colors: Colors;
+  button: { rest: string; pressed: string };
+  question: Question;
+  letter: string;
+  workspaceId: string;
+  onCopy(): void;
+  onSent(): void;
+};
+
+// Send when the agent that asked can be reached from Paseo, Copy otherwise.
+function AnswerButtons(props: AnswerButtonsProps) {
+  const { question, letter } = props;
+  if (question.agentId && answerMessage(question, letter)) return <SendOrCopy {...props} agentId={question.agentId} />;
+  return <CopyChoice {...props} />;
+}
+
+function SendOrCopy({ agentId, ...props }: AnswerButtonsProps & { agentId: string }) {
+  const { colors, button, question, letter, workspaceId, onSent } = props;
+  const { messages: m } = useProgressLanguage();
+  const send = useSendAnswer(workspaceId);
+  // Only an agent in this workspace: the progress file names the agent, and
+  // another workspace's agent has no business with this answer.
+  const here = useAgent(agentId, (agent) => agent.workspaceId === workspaceId);
+  if (!here) return <CopyChoice {...props} />;
+  const alreadySent = sentChoice(workspaceId, question) === letter;
+  return (
+    <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+      <AnswerButton
+        colors={colors}
+        button={button}
+        icon={alreadySent ? "Check" : "Send"}
+        label={alreadySent ? m.choiceSent : m.sendChoice(question.id, letter)}
+        accessibilityLabel={alreadySent ? m.sentChoice(question.id, letter) : m.sendChoiceToAgent(question.id, letter)}
+        disabled={alreadySent}
+        onPress={() => {
+          void send(question, letter);
+          onSent();
+        }}
+      />
+      <CopyChoice {...props} iconOnly />
+    </View>
+  );
+}
+
+function CopyChoice({ colors, button, question, letter, onCopy, iconOnly = false }: AnswerButtonsProps & { iconOnly?: boolean }) {
+  const { messages: m } = useProgressLanguage();
+  return (
+    <AnswerButton
+      colors={colors}
+      button={button}
+      icon="Copy"
+      label={iconOnly ? undefined : m.copyChoice(question.id, letter)}
+      accessibilityLabel={m.copyChoiceForAgent(question.id, letter)}
+      onPress={onCopy}
+    />
+  );
+}
+
+function AnswerButton({
+  colors,
+  button,
+  icon,
+  label,
+  accessibilityLabel,
+  disabled = false,
+  onPress,
+}: {
+  colors: Colors;
+  button: { rest: string; pressed: string };
+  icon: "Check" | "Copy" | "Send";
+  label?: string;
+  accessibilityLabel: string;
+  disabled?: boolean;
+  onPress(): void;
+}) {
+  return (
+    <PressScale
+      accessibilityRole="button"
+      accessibilityLabel={accessibilityLabel}
+      disabled={disabled}
+      onPress={disabled ? undefined : onPress}
+      hitSlop={4}
+      style={({ pressed }) => ({
+        flexDirection: "row",
+        alignItems: "center",
+        gap: 4,
+        paddingLeft: 6,
+        paddingRight: label ? 8 : 6,
+        paddingVertical: label ? 3 : 5,
+        borderRadius: 4,
+        opacity: disabled ? 0.6 : 1,
+        ...raised(colors),
+        backgroundColor: pressed ? button.pressed : button.rest,
+      })}
+    >
+      <Icon name={icon} size={12} color={colors.foreground} />
+      {label ? <Text style={{ color: colors.foreground, fontSize: 12, lineHeight: 16 }}>{label}</Text> : null}
+    </PressScale>
   );
 }
