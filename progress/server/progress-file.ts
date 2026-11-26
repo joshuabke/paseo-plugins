@@ -5,7 +5,7 @@
 import { access, readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { EMPTY_DASHBOARD, latestRun, parseProgress, reduceProgress, type Dashboard, type NextIds } from "../shared/dashboard.ts";
-import { EVENT_VERSION, eventSchema, PANEL_OPENED_NAME, PROGRESS_FILE_NAME, type ProgressEvent } from "../shared/events.ts";
+import { EVENT_VERSION, eventSchema, isProgressReport, PANEL_OPENED_NAME, PROGRESS_FILE_NAME, type ProgressEvent } from "../shared/events.ts";
 import { withLock } from "./lock.ts";
 import { appendFileIn, makeFolder, writeFileIn } from "./system.ts";
 
@@ -24,9 +24,10 @@ export interface ProgressRead {
   panelOpened: boolean;
 }
 
-// The parsed file per folder, kept until its size or change time moves. The
-// file only grows, and the panel and pills read it every few seconds.
-const parsedFiles = new Map<string, { size: number; mtimeMs: number; ctimeMs: number; parsed: ReturnType<typeof parseProgress> }>();
+// The parsed file per folder, kept until its size, change time or file moves.
+// The file grows, or a progress report replaces it (see `compactReport`), and
+// the panel and pills read it every few seconds.
+const parsedFiles = new Map<string, { size: number; mtimeMs: number; ctimeMs: number; ino: number; parsed: ReturnType<typeof parseProgress> }>();
 // Replaced file snapshots and their derived data can be collected together.
 const dashboards = new WeakMap<ReturnType<typeof parseProgress>, { dashboard: Dashboard; from: number; until: number }>();
 
@@ -74,6 +75,19 @@ export async function appendProgress<T>(
     if (!checked.success) {
       throw new InvalidEvent(checked.error.issues.map((issue) => `${issue.path.join(".") || "value"}: ${issue.message}`).join("; "));
     }
+    const compacted = compactReport(text, checked.data);
+    if (compacted !== null) {
+      // A rename replaces the file whole, so a reader sees the old file or the new one.
+      const replaced = await writeFileIn(directory, PROGRESS_FILE_NAME, compacted, { atomic: true }).then(
+        () => true,
+        // Windows refuses the rename while another program holds the file open; append instead.
+        () => false,
+      );
+      if (replaced) {
+        await after?.(compacted);
+        return result;
+      }
+    }
     // A line cut short (a killed command, a hand edit) would swallow this event, so start a new line.
     const lead = text && !text.endsWith("\n") ? "\n" : "";
     const line = `${lead}${JSON.stringify(checked.data)}\n`;
@@ -81,6 +95,30 @@ export async function appendProgress<T>(
     await after?.(text + line);
     return result;
   });
+}
+
+// A job that reports its progress every minute would fill the file with
+// lines nobody reads again. So while nothing but progress reports follow a
+// ticket's last report, a new report for it replaces that line, keeping any
+// field only the old one set. The file as it should be, or null to append.
+export function compactReport(text: string, event: ProgressEvent): string | null {
+  if (!isProgressReport(event) || !text.endsWith("\n")) return null;
+  const lines = text.slice(0, -1).split("\n");
+  for (let index = lines.length - 1; index >= 0; index--) {
+    if (!lines[index].trim()) continue;
+    let earlier: ProgressEvent;
+    try {
+      earlier = eventSchema.parse(JSON.parse(lines[index]));
+    } catch {
+      return null;
+    }
+    if (!isProgressReport(earlier)) return null;
+    if (earlier.id !== event.id) continue;
+    lines.splice(index, 1);
+    lines.push(JSON.stringify({ ...earlier, ...withoutUndefined(event) }));
+    return `${lines.join("\n")}\n`;
+  }
+  return null;
 }
 
 export async function markPanelOpened(directory: string): Promise<void> {
@@ -106,7 +144,8 @@ async function readParsed(directory: string): Promise<ReturnType<typeof parsePro
     return null;
   }
   const cached = parsedFiles.get(directory);
-  if (cached && cached.size === info.size && cached.mtimeMs === info.mtimeMs && cached.ctimeMs === info.ctimeMs) return cached.parsed;
+  if (cached && cached.size === info.size && cached.mtimeMs === info.mtimeMs && cached.ctimeMs === info.ctimeMs && cached.ino === info.ino)
+    return cached.parsed;
   // Stat before reading: if the file grows in between, the next stat won't match and it's read again.
   const text = await readText(directory);
   if (text === null) {
@@ -114,7 +153,7 @@ async function readParsed(directory: string): Promise<ReturnType<typeof parsePro
     return null;
   }
   const parsed = parseProgress(text);
-  parsedFiles.set(directory, { size: info.size, mtimeMs: info.mtimeMs, ctimeMs: info.ctimeMs, parsed });
+  parsedFiles.set(directory, { size: info.size, mtimeMs: info.mtimeMs, ctimeMs: info.ctimeMs, ino: info.ino, parsed });
   return parsed;
 }
 
