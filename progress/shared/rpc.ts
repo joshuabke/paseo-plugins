@@ -109,7 +109,6 @@ export const getToolsStatus = defineRpc({
   output: z.object({ state: z.enum(TOOLS_STATES) }),
 });
 
-// The paseo-progress skill, linked into each agent's skills folder.
 const skillState = z.enum(["missing", "current", "outdated", "foreign"]);
 const skillStatus = z.object({
   state: skillState,
@@ -198,6 +197,7 @@ export const previewDeliverable = defineRpc({
     z.object({ kind: z.literal("text"), text: z.string(), bytes: z.number(), truncated: z.boolean() }),
     z.object({ kind: z.literal("markdown"), markdown: z.string(), bytes: z.number(), truncated: z.boolean() }),
     z.object({ kind: z.literal("folder"), entries: z.array(z.object({ name: z.string(), folder: z.boolean() })), truncated: z.boolean() }),
+    z.object({ kind: z.literal("outside") }),
   ]),
 });
 

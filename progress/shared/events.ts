@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { QUESTION_MODES } from "./question-modes.ts";
+import { workspaceIdSchema } from "./workspace.ts";
 
 // One line of `progress.jsonl`. The command-line tool writes these; the
 // dashboard reducer reads them. `v` lets later versions change a shape without
@@ -16,7 +17,9 @@ export type TicketStatus = z.infer<typeof ticketStatusSchema>;
 const text = z.string().trim().min(1);
 const minutes = z.number().int().positive().max(100_000);
 // `by` is the Paseo agent that wrote the event, absent when run outside Paseo.
-const base = { v: z.literal(EVENT_VERSION), ts: z.iso.datetime(), by: text.optional() };
+// An older plugin's z.object strips `ws` and reads every event as the folder's,
+// so the version stays 1.
+const base = { v: z.literal(EVENT_VERSION), ts: z.iso.datetime(), by: text.optional(), ws: workspaceIdSchema.optional() };
 
 export const questionOptionSchema = z.object({
   letter: z.string().regex(/^[A-Z]$/),
@@ -72,6 +75,13 @@ export const eventSchema = z.discriminatedUnion("type", [
     waitsFor: z.string().trim().optional(),
     // Empty clears it.
     source: z.union([fileLinkSchema, z.literal("")]).optional(),
+    // How far the ticket's own work is, as a script or agent reports it, in
+    // percent. Empty clears it. See PROGRESS_FIELDS.
+    progress: z.union([z.number().min(0).max(100), z.literal("")]).optional(),
+    // When the work is expected to be done. Empty clears it.
+    eta: z.union([z.iso.datetime(), z.literal("")]).optional(),
+    // A line about where the work is, like "Step 26000/36400". Empty clears it.
+    detail: z.string().trim().optional(),
   }),
   z.object({ ...base, type: z.literal("ticket.remove"), id: text }),
   // A blocker that is not a ticket status, like a failing external service.
@@ -145,3 +155,25 @@ export const eventSchema = z.discriminatedUnion("type", [
 
 export type ProgressEvent = z.infer<typeof eventSchema>;
 export type ProgressEventType = ProgressEvent["type"];
+
+// The ticket.update fields a running job reports, maybe every minute. They are
+// no change to the ticket's story, so they stay out of its history, and the
+// file keeps only the latest report (see `compactRepeated` in progress-file.ts).
+export const PROGRESS_FIELDS = ["progress", "eta", "detail"] as const;
+
+type TicketUpdate = Extract<ProgressEvent, { type: "ticket.update" }>;
+
+// A ticket.update that only reports progress.
+export function isProgressReport(event: ProgressEvent): event is TicketUpdate {
+  if (event.type !== "ticket.update") return false;
+  const fields = Object.entries(event).filter(([key, value]) => value !== undefined && !["v", "ts", "ws", "by", "type", "id"].includes(key));
+  return fields.length > 0 && fields.every(([key]) => (PROGRESS_FIELDS as readonly string[]).includes(key));
+}
+
+// What a newer event of the same key makes unreadable: a ticket's progress
+// report, or the ticker, which shows only its latest line. Null for the rest.
+// Each workspace has its own tickets and ticker in the shared file.
+export function repeatKey(event: ProgressEvent): string | null {
+  if (isProgressReport(event)) return `progress:${event.ws ?? ""}:${event.id}`;
+  return event.type === "ticker.set" ? `ticker:${event.ws ?? ""}` : null;
+}

@@ -2,7 +2,7 @@
 // dashboard the panel would get.
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { appendFile, mkdir, mkdtemp, readdir, readFile, readlink, realpath, rm, symlink, truncate, utimes, writeFile } from "node:fs/promises";
+import { appendFile, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, truncate, utimes, writeFile } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
 import { basename, delimiter, dirname, join } from "node:path";
 import { test, type TestContext } from "node:test";
@@ -11,11 +11,12 @@ import { promisify } from "node:util";
 import type { PluginHandlerContext } from "@getpaseo/plugin/server";
 import { runCli } from "./cli.ts";
 import { handleGetAttention, handleGetDashboard, handleListFolders, handleMarkPanelOpened, handleSetHistoryFolder } from "./dashboard.ts";
-import { markPanelOpened, readProgress } from "./progress-file.ts";
+import { markPanelOpened, outsideDirectory, readProgress } from "./progress-file.ts";
+import { panelDashboardAt } from "./paths.ts";
 import { formatMinutes, formatTimeOfDay, formatWorkDone } from "../shared/format.ts";
 import { finishedToFold, headlineText, livenessOf, statusLineState, type Ticket } from "../shared/dashboard.ts";
 import { defaultLauncherPath, installLauncher, launcherStatus, paseoCommands } from "./launcher.ts";
-import { defaultSkillPaths, installSkill, relinkSkill, skillDocument, skillSource, skillStatus } from "./skill.ts";
+import { defaultSkillPaths, retiredSkillPaths, retireSkill, skillDocument, skillSource, skillStatus, syncSkill } from "./skill.ts";
 import {
   canOpenFiles,
   hostOpener,
@@ -41,7 +42,7 @@ import {
   isFolder,
   opensOnHost,
 } from "../shared/attachments.ts";
-import { findStore, outsideDirectory, runFileName } from "./store.ts";
+import { runFileName } from "./store.ts";
 import { mirrorQuestionMode, questionModePath, readQuestionMode, writeQuestionMode } from "./question-mode.ts";
 import type { QuestionMode } from "../shared/question-modes.ts";
 import { ticketStory } from "../shared/ticket-story.ts";
@@ -54,6 +55,8 @@ process.env.GIT_CONFIG_NOSYSTEM = "1";
 const HOME = await realpath(await mkdtemp(join(tmpdir(), "progress-home-")));
 process.env.HOME = HOME;
 test.after(() => rm(HOME, { recursive: true, force: true }));
+// Scripts these tests run read the folder's dashboard, not the workspace of the agent running the tests.
+delete process.env.PASEO_WORKSPACE_ID;
 const git = async (cwd: string, ...args: string[]) =>
   (await promisify(execFile)("git", ["-c", "user.name=t", "-c", "user.email=t@t", ...args], { cwd })).stdout;
 
@@ -77,6 +80,7 @@ async function worktree(t: TestContext) {
     directory,
     // Where the working files are, outside the repo.
     store,
+    dashboardAt: { root: directory, workspace: null },
     output,
     at(minute: number) {
       clock = minute;
@@ -87,11 +91,11 @@ async function worktree(t: TestContext) {
     // Run as the Paseo agent with this id.
     async runAs(agentId: string | undefined, ...argv: string[]) {
       output.length = 0;
-      const code = await runCli(argv, { cwd: directory, now: () => minutes(clock), out: (line) => output.push(line), agentId });
+      const code = await runCli(argv, { workspace: null, cwd: directory, now: () => minutes(clock), out: (line) => output.push(line), agentId });
       return { code, text: output.join("\n") };
     },
     // Read at the current clock, or at a given minute.
-    dashboard: (minute = clock) => readProgress(store, minutes(minute)),
+    dashboard: (minute = clock) => readProgress({ root: directory, workspace: null }, minutes(minute)),
   };
 }
 
@@ -136,7 +140,7 @@ test("a name starting with two dots is inside the worktree", async (t) => {
   await w.run("deliverable", "add", "Notes", "..notes/a.md");
   const { dashboard } = await w.dashboard();
   assert.equal(dashboard.deliverables[0].path, "..notes/a.md");
-  assert.deepEqual(await previewDeliverable(w.directory, "D1"), { kind: "markdown", markdown: "# A", bytes: 3, truncated: false });
+  assert.deepEqual(await previewDeliverable(w.dashboardAt, "D1"), { kind: "markdown", markdown: "# A", bytes: 3, truncated: false });
 });
 
 test("finish closes the run only once everything is settled, and keeps it on the dashboard", async (t) => {
@@ -286,7 +290,7 @@ test("opening the panel is remembered in the worktree", async (t) => {
   const w = await worktree(t);
   await w.run("start", "Export");
   assert.equal((await w.dashboard()).panelOpened, false);
-  await markPanelOpened(w.store);
+  await markPanelOpened(w.dashboardAt.root);
   assert.equal((await w.dashboard()).panelOpened, true);
   await w.run("start", "Another run");
   assert.equal((await w.dashboard()).panelOpened, true, "a new run doesn't bring the pill back");
@@ -411,7 +415,7 @@ test("commands find the worktree root from a subdirectory", async (t) => {
   const w = await worktree(t);
   const nested = join(w.directory, "packages", "app");
   await mkdir(nested, { recursive: true });
-  assert.equal(await runCli(["start", "From below"], { cwd: nested, out: () => {} }), 0);
+  assert.equal(await runCli(["start", "From below"], { workspace: null, cwd: nested, out: () => {} }), 0);
   assert.equal((await w.dashboard()).dashboard.run?.title, "From below");
 });
 
@@ -430,7 +434,7 @@ test("a subagent in its own checkout records on its agent's dashboard", async (t
   const main = await worktree(t);
   const output: string[] = [];
   const runIn = (cwd: string, agentCwd: string | undefined, ...argv: string[]) =>
-    runCli(argv, { cwd, agentCwd, now: () => minutes(0), out: (line) => output.push(line) });
+    runCli(argv, { workspace: null, cwd, agentCwd, now: () => minutes(0), out: (line) => output.push(line) });
   const inWorkspace = await checkout(w.directory, ".claude", "worktrees", "agent-1");
   const inMainCheckout = await checkout(main.directory, ".claude", "worktrees", "agent-2");
   const vendored = await checkout(w.directory, "vendor", "library");
@@ -454,8 +458,8 @@ test("a subagent in its own checkout records on its agent's dashboard", async (t
 
   assert.equal(await runIn(vendored, w.directory, "start", "Another repo"), 0, "a checkout that isn't a subagent's keeps its own dashboard");
   assert.equal(await runIn(inMainCheckout, undefined, "start", "Outside Paseo"), 0, "so does a subagent's checkout outside Paseo");
-  assert.equal((await readProgress(outsideDirectory(vendored), minutes(0))).dashboard.run?.title, "Another repo");
-  assert.equal((await readProgress(outsideDirectory(inMainCheckout), minutes(0))).dashboard.run?.title, "Outside Paseo");
+  assert.equal((await readProgress({ root: vendored, workspace: null }, minutes(0))).dashboard.run?.title, "Another repo");
+  assert.equal((await readProgress({ root: inMainCheckout, workspace: null }, minutes(0))).dashboard.run?.title, "Outside Paseo");
   assert.equal((await w.dashboard()).dashboard.run?.title, "Run");
 });
 
@@ -483,7 +487,7 @@ test("a workspace below the worktree root reads the root's progress and attachme
   await mkdir(join(w.directory, "reports"), { recursive: true });
   await mkdir(workspace, { recursive: true });
   await writeFile(join(w.directory, "reports", "review.md"), "# A");
-  const run = (...argv: string[]) => runCli(argv, { cwd: workspace, now: () => minutes(0), out: () => {} });
+  const run = (...argv: string[]) => runCli(argv, { workspace: null, cwd: workspace, now: () => minutes(0), out: () => {} });
   assert.equal(await run("start", "From the app"), 0);
   assert.equal(await run("deliverable", "add", "Review", "../../reports/review.md"), 0);
   assert.equal(await run("question", "ask", "Pick", "Which?", "--option", "A=One", "--option", "B=Two", "--recommend", "A"), 0);
@@ -497,7 +501,7 @@ test("a workspace below the worktree root reads the root's progress and attachme
   assert.equal((await handleGetAttention(input, context)).questions, 1);
   await handleMarkPanelOpened(input, context);
   assert.equal((await handleGetAttention(input, context)).panelOpened, true);
-  assert.deepEqual(await previewDeliverable(workspace, "D1"), { kind: "markdown", markdown: "# A", bytes: 3, truncated: false });
+  assert.deepEqual(await previewDeliverable(panelDashboardAt(input), "D1"), { kind: "markdown", markdown: "# A", bytes: 3, truncated: false });
 });
 
 test("the handler reads the requested workspace directory without calling Paseo", async (t) => {
@@ -566,7 +570,7 @@ test("unchanged dashboards are reused until exact stale and overdue boundaries, 
   assert.equal(stale.stale, true);
   assert.equal(first.stale, false, "cached snapshots are never mutated");
   assert.strictEqual((await w.dashboard(20)).dashboard, stale, "exactly at the estimate is not overdue");
-  const overdue = (await readProgress(w.store, new Date(minutes(20).getTime() + 1))).dashboard;
+  const overdue = (await readProgress(w.dashboardAt, new Date(minutes(20).getTime() + 1))).dashboard;
   assert.equal(overdue.stuck.length, 1);
   assert.equal(overdue.stuck[0].kind, "overdue");
   assert.strictEqual((await w.dashboard(60)).dashboard, overdue, "no further time changes remain");
@@ -580,7 +584,7 @@ test("each working ticket's overdue moment ends the cached dashboard", async (t)
   await w.run("start", "Run");
   await w.run("ticket", "add", "Short", "--estimate", "5", "--status", "working");
   await w.run("ticket", "add", "Long", "--estimate", "10", "--status", "working");
-  const after = (minute: number) => readProgress(w.store, new Date(minutes(minute).getTime() + 1));
+  const after = (minute: number) => readProgress(w.dashboardAt, new Date(minutes(minute).getTime() + 1));
   const first = (await w.dashboard(0)).dashboard;
   assert.strictEqual((await w.dashboard(5)).dashboard, first);
   const one = (await after(5)).dashboard;
@@ -619,7 +623,7 @@ test("opening the panel changes the response version without rebuilding the dash
   const input = { workspaceId: "ws-1", workspaceDirectory: w.directory };
   const first = await handleGetDashboard(input, context);
   assert.ok("dashboard" in first);
-  await markPanelOpened(w.store);
+  await markPanelOpened(w.dashboardAt.root);
   const opened = await handleGetDashboard({ ...input, since: first.version }, context);
   assert.ok("dashboard" in opened);
   assert.strictEqual(opened.dashboard, first.dashboard);
@@ -638,21 +642,32 @@ test("the command runs as a script and stamps the real time", async (t) => {
   assert.ok(updatedAt >= before - 1000 && updatedAt <= Date.now() + 1000);
 });
 
-test("each event records the Paseo agent that wrote it, from PASEO_AGENT_ID", async (t) => {
+test("each event records the Paseo agent and workspace that wrote it, from PASEO_AGENT_ID and PASEO_WORKSPACE_ID", async (t) => {
   const w = await worktree(t);
   const cli = fileURLToPath(new URL("./cli.ts", import.meta.url));
   const run = (env: NodeJS.ProcessEnv, ...argv: string[]) => promisify(execFile)(process.execPath, [cli, ...argv], { cwd: w.directory, env });
   const { PASEO_AGENT_ID: _, ...outside } = process.env;
   await run({ ...process.env, PASEO_AGENT_ID: "agent-a" }, "start", "Run");
   await run(outside, "ticker", "set", "From a terminal");
+  const stores = join(HOME, ".local", "state", "paseo-progress");
+  const before = (await readdir(stores)).toSorted();
+  await run({ ...outside, PASEO_WORKSPACE_ID: "wks_0123456789abcdef" }, "ticker", "set", "From a workspace");
+  await run({ ...outside, PASEO_WORKSPACE_ID: "wks_../../x" }, "ticker", "set", "From a bad ID");
   const lines = (await readFile(join(w.store, "progress.jsonl"), "utf8"))
     .trim()
     .split("\n")
     .map((line) => JSON.parse(line));
   assert.deepEqual(
-    lines.map((line) => line.by),
-    ["agent-a", undefined],
+    lines.map((line) => [line.by, line.ws]),
+    [
+      ["agent-a", undefined],
+      [undefined, undefined],
+      [undefined, "wks_0123456789abcdef"],
+      [undefined, undefined],
+    ],
+    "an ID Progress can't read writes the folder's dashboard",
   );
+  assert.deepEqual((await readdir(stores)).toSorted(), before, "and makes no folder");
 });
 
 test("an agent hears about tickets another session added, once, on its next command", async (t) => {
@@ -725,7 +740,7 @@ test("a ticket links to where it's written up: a file in the worktree or a link,
     /T01 .*Ticket 01: Login\n      Source: specs\/01-login.md\n.*T02 .*\n      Source: https:\/\/linear.app\/acme\/issue\/ENG-12 \(ENG-12\)\n.*T03 .*No write-up(\n|$)/,
   );
 
-  assert.deepEqual(await previewDeliverable(w.directory, "T01.source"), { kind: "markdown", markdown: "# Login\n", bytes: 8, truncated: false });
+  assert.deepEqual(await previewDeliverable(w.dashboardAt, "T01.source"), { kind: "markdown", markdown: "# Login\n", bytes: 8, truncated: false });
 
   assert.equal((await w.run("ticket", "update", "T03", "--source", "specs/01-login.md=Shared spec")).text, "Updated T03: source specs/01-login.md");
   await w.run("ticket", "update", "T02", "--source", "");
@@ -1381,6 +1396,7 @@ test("deliverables are listed newest first with root-relative paths, their ticke
     "Added D1: Browser check screenshots",
   );
   const fromBelow = await runCli(["deliverable", "add", "Review report", "report.html", "--kind", "report"], {
+    workspace: null,
     cwd: nested,
     now: () => minutes(1),
     out: () => {},
@@ -1491,7 +1507,7 @@ test("concurrent writers never share an id or produce a broken line", async (t) 
     promisify(execFile)(process.execPath, [cli, "ticket", "add", `Spawned ${index}`, "--estimate", "5"], { cwd: w.directory }),
   );
   const inProcess = Array.from({ length: 14 }, (_, index) =>
-    runCli(["ticket", "add", `Local ${index}`, "--estimate", "5"], { cwd: w.directory, out: () => {} }),
+    runCli(["ticket", "add", `Local ${index}`, "--estimate", "5"], { workspace: null, cwd: w.directory, out: () => {} }),
   );
   await Promise.all([...spawned, ...inProcess]);
   const { dashboard } = await w.dashboard();
@@ -1544,16 +1560,16 @@ test("show prints the dashboard as text for the agent", async (t) => {
 
 async function runShow(w: Awaited<ReturnType<typeof worktree>>, minute: number) {
   const output: string[] = [];
-  const code = await runCli(["show"], { cwd: w.directory, now: () => minutes(minute), out: (line) => output.push(line) });
+  const code = await runCli(["show"], { workspace: null, cwd: w.directory, now: () => minutes(minute), out: (line) => output.push(line) });
   return { code, text: output.join("\n") };
 }
 
 test("the launcher runs the command from the plugin folder Paseo reports", async (t) => {
   const w = await worktree(t);
   const target = join(w.directory, "bin", "paseo-progress");
-  assert.equal(await runCli(["install-launcher", target], { cwd: w.directory, out: () => {} }), 0);
+  assert.equal(await runCli(["install-launcher", target], { workspace: null, cwd: w.directory, out: () => {} }), 0);
   const output: string[] = [];
-  await runCli(["install-launcher", target], { cwd: w.directory, out: (line) => output.push(line) });
+  await runCli(["install-launcher", target], { workspace: null, cwd: w.directory, out: (line) => output.push(line) });
   assert.match(output[0], /already current/);
   const pluginDir = fileURLToPath(new URL("..", import.meta.url));
   const { stdout } = await promisify(execFile)(target, ["start", "Via launcher"], {
@@ -1657,12 +1673,12 @@ test("a local deliverable opens on the daemon host by id, only inside the worktr
     opened.push(path);
   };
   const root = await realpath(w.directory);
-  assert.deepEqual(await openDeliverable(w.directory, "D1", opener), { opened: join(root, "reports", "review.pdf") });
+  assert.deepEqual(await openDeliverable(w.dashboardAt, "D1", opener), { opened: join(root, "reports", "review.pdf") });
   assert.deepEqual(opened, [join(root, "reports", "review.pdf")]);
-  await assert.rejects(openDeliverable(w.directory, "D2", opener), /reports\/missing\.pdf no longer exists/);
-  await assert.rejects(openDeliverable(w.directory, "D3", opener), /is outside this worktree/);
-  await assert.rejects(openDeliverable(w.directory, "D4", opener), /No local deliverable D4/, "web links are not opened on the host");
-  await assert.rejects(openDeliverable(w.directory, "D9", opener), /No local deliverable D9/);
+  await assert.rejects(openDeliverable(w.dashboardAt, "D2", opener), /reports\/missing\.pdf no longer exists/);
+  await assert.rejects(openDeliverable(w.dashboardAt, "D3", opener), /is outside this worktree/);
+  await assert.rejects(openDeliverable(w.dashboardAt, "D4", opener), /No local deliverable D4/, "web links are not opened on the host");
+  await assert.rejects(openDeliverable(w.dashboardAt, "D9", opener), /No local deliverable D9/);
   assert.equal(opened.length, 1);
 });
 
@@ -1708,7 +1724,7 @@ test("only files whose default app shows them open on the host, and the panel of
   const opened: string[] = [];
   const outcomes: Record<string, boolean> = {};
   for (const deliverable of dashboard.deliverables) {
-    const result = await openDeliverable(w.directory, deliverable.id, async (path) => {
+    const result = await openDeliverable(w.dashboardAt, deliverable.id, async (path) => {
       opened.push(basename(path));
     }).then(
       () => true,
@@ -1744,7 +1760,7 @@ test("a folder deliverable previews as its files, each found by the folder's id"
   const { dashboard } = await w.dashboard();
   const folder = deliverableAttachment(dashboard.deliverables[0]);
   assert.equal(canPreview(folder, { browser: false }), true, "pressing a folder opens it in Paseo, not on the computer running Paseo");
-  const listed = await previewDeliverable(w.directory, "D1");
+  const listed = await previewDeliverable(w.dashboardAt, "D1");
   assert.deepEqual(
     listed,
     {
@@ -1772,11 +1788,11 @@ test("a folder deliverable previews as its files, each found by the folder's id"
     "a folder and its text files preview on any screen",
   );
   assert.equal(findAttachment(dashboard, "Q1.1")?.path, "shots/", "a folder given without a slash is stored as one, so it lists too");
-  assert.deepEqual(await previewDeliverable(w.directory, "D1/step 2.md"), { kind: "markdown", markdown: "# Two", bytes: 5, truncated: false });
-  assert.deepEqual(await previewDeliverable(w.directory, "D1/older"), { kind: "folder", entries: [{ name: "first.md", folder: false }], truncated: false });
-  assert.deepEqual(await previewDeliverable(w.directory, "D1/older/first.md"), { kind: "markdown", markdown: "# First", bytes: 7, truncated: false });
+  assert.deepEqual(await previewDeliverable(w.dashboardAt, "D1/step 2.md"), { kind: "markdown", markdown: "# Two", bytes: 5, truncated: false });
+  assert.deepEqual(await previewDeliverable(w.dashboardAt, "D1/older"), { kind: "folder", entries: [{ name: "first.md", folder: false }], truncated: false });
+  assert.deepEqual(await previewDeliverable(w.dashboardAt, "D1/older/first.md"), { kind: "markdown", markdown: "# First", bytes: 7, truncated: false });
   const opened: string[] = [];
-  await openDeliverable(w.directory, "D1/older/first.md", async (path) => {
+  await openDeliverable(w.dashboardAt, "D1/older/first.md", async (path) => {
     opened.push(path);
   });
   assert.deepEqual(opened, [join(await realpath(w.directory), "shots", "older", "first.md")]);
@@ -1792,15 +1808,15 @@ test("a file inside a folder deliverable can't step out of the folder or the wor
   await writeFile(join(away, "x.md"), "# Away");
   await symlink(join(away, "x.md"), join(w.directory, "shots", "link.md"));
   await w.run("deliverable", "add", "Screenshots", "shots/");
-  await assert.rejects(previewDeliverable(w.directory, "D1/../secret.md"), /secret\.md is outside shots\//);
+  await assert.rejects(previewDeliverable(w.dashboardAt, "D1/../secret.md"), /secret\.md is outside shots\//);
   await assert.rejects(
-    previewDeliverable(w.directory, `D1/${join(w.directory, "secret.md")}`),
+    previewDeliverable(w.dashboardAt, `D1/${join(w.directory, "secret.md")}`),
     /^Error: shots\/.+\/secret\.md no longer exists/,
     "an absolute path is read inside the folder",
   );
-  await assert.rejects(previewDeliverable(w.directory, "D1/link.md"), /shots\/link\.md is outside this worktree/);
+  assert.deepEqual(await previewDeliverable(w.dashboardAt, "D1/link.md"), { kind: "outside" }, "a link out of the worktree isn't followed");
   await assert.rejects(
-    openDeliverable(w.directory, "D9/a.md", async () => {}),
+    openDeliverable(w.dashboardAt, "D9/a.md", async () => {}),
     /No local deliverable D9/,
   );
 });
@@ -1811,7 +1827,7 @@ test("a folder with more entries than the preview lists says it stopped", async 
   await mkdir(join(w.directory, "logs"));
   await Promise.all(Array.from({ length: MAX_FOLDER_ENTRIES + 1 }, (_, index) => writeFile(join(w.directory, "logs", `${index}.log`), "")));
   await w.run("deliverable", "add", "Logs", "logs/");
-  const listed = await previewDeliverable(w.directory, "D1");
+  const listed = await previewDeliverable(w.dashboardAt, "D1");
   assert.equal(listed.kind === "folder" && listed.entries.length, MAX_FOLDER_ENTRIES);
   assert.equal(listed.kind === "folder" && listed.truncated, true);
 });
@@ -1825,7 +1841,7 @@ test("a Linux server with no desktop says it can't open files, and the preview h
   const empty = await mkdtemp(join(tmpdir(), "progress-empty-"));
   t.after(() => Promise.all([bin, empty].map((path) => rm(path, { recursive: true, force: true }))));
   const server = { PATH: empty };
-  await assert.rejects(openDeliverable(w.directory, "D1", hostOpener("linux", server)), { message: `Can't open files on ${hostname()}` });
+  await assert.rejects(openDeliverable(w.dashboardAt, "D1", hostOpener("linux", server)), { message: `Can't open files on ${hostname()}` });
   assert.equal(canOpenFiles("linux", server), false, "no desktop and no xdg-open");
   await writeFile(join(bin, "xdg-open"), "#!/bin/sh\n", { mode: 0o755 });
   assert.equal(canOpenFiles("linux", { PATH: bin }), false, "xdg-open without a desktop session");
@@ -1840,7 +1856,7 @@ test("every screen gives an attachment the same icon, and SVGs preview only wher
   await w.run("deliverable", "add", "Findings", "notes/findings.md", "--kind", "report");
   await w.run("deliverable", "add", "Logo", "art/logo.svg");
   await w.run("question", "ask", "Logo", "Which logo?", "--recommend", "A", "--file", "art/logo.svg=Current");
-  const { dashboard } = await readProgress(w.store);
+  const { dashboard } = await readProgress(w.dashboardAt);
   const report = findAttachment(dashboard, dashboard.deliverables.find((entry) => entry.title === "Findings")!.id)!;
   assert.equal(attachmentIcon(report), "FileChartColumn", "the recorded kind wins over the extension, wherever the deliverable is listed");
   assert.equal(attachmentIcon(deliverableAttachment(dashboard.deliverables.find((entry) => entry.title === "Findings")!)), "FileChartColumn");
@@ -1868,12 +1884,12 @@ test("a Markdown deliverable previews with its links pointed at its own folder, 
   const expected = report.replace("shots/home page.png", `${folder}/shots/home%20page.png`).replace("../spec.md#L4", `${join(w.directory, "docs")}/spec.md#L4`);
   for (const directory of [w.directory, workspace]) {
     assert.deepEqual(
-      await previewDeliverable(directory, "D1"),
+      await previewDeliverable(panelDashboardAt({ workspaceId: "ws-1", workspaceDirectory: directory }), "D1"),
       { kind: "markdown", markdown: expected, bytes: Buffer.byteLength(report) + 2, truncated: false },
       "resolved from the file's folder in the worktree, whichever workspace asks",
     );
   }
-  assert.deepEqual(await previewDeliverable(w.directory, "D2"), { kind: "text", text: "import X from './x'\n\n[a](b.md)\n", bytes: 31, truncated: false });
+  assert.deepEqual(await previewDeliverable(w.dashboardAt, "D2"), { kind: "text", text: "import X from './x'\n\n[a](b.md)\n", bytes: 31, truncated: false });
 });
 
 test("image and text deliverables preview, only inside the worktree", async (t) => {
@@ -1886,30 +1902,33 @@ test("image and text deliverables preview, only inside the worktree", async (t) 
   await w.run("deliverable", "add", "Home", "shots/home.PNG");
   await w.run("deliverable", "add", "Notes", "shots/notes.md");
   await w.run("deliverable", "add", "Huge", "shots/huge.jpg");
-  await w.run("deliverable", "add", "Outside", join(tmpdir(), "elsewhere.png"));
-  assert.deepEqual(await previewDeliverable(w.directory, "D1"), {
+  const away = await mkdtemp(join(tmpdir(), "progress-away-"));
+  t.after(() => rm(away, { recursive: true, force: true }));
+  await writeFile(join(away, "elsewhere.png"), png);
+  await w.run("deliverable", "add", "Outside", join(away, "elsewhere.png"));
+  assert.deepEqual(await previewDeliverable(w.dashboardAt, "D1"), {
     kind: "image",
     dataUri: `data:image/png;base64,${png.toString("base64")}`,
     bytes: png.length,
   });
-  assert.deepEqual(await previewDeliverable(w.directory, "D2"), { kind: "markdown", markdown: "# Notes", bytes: 7, truncated: false });
+  assert.deepEqual(await previewDeliverable(w.dashboardAt, "D2"), { kind: "markdown", markdown: "# Notes", bytes: 7, truncated: false });
   await writeFile(join(w.directory, "shots", "data.bin"), "x");
   await w.run("deliverable", "add", "Data", "shots/data.bin");
-  await assert.rejects(previewDeliverable(w.directory, "D5"), /isn't an image, video, PDF or text file/);
-  await assert.rejects(previewDeliverable(w.directory, "D3"), /too large to preview/);
-  await assert.rejects(previewDeliverable(w.directory, "D4"), /no longer exists|outside this worktree/);
+  await assert.rejects(previewDeliverable(w.dashboardAt, "D5"), /isn't an image, video, PDF or text file/);
+  await assert.rejects(previewDeliverable(w.dashboardAt, "D3"), /too large to preview/);
+  assert.deepEqual(await previewDeliverable(w.dashboardAt, "D4"), { kind: "outside" });
   const longLog = "x".repeat(MAX_PREVIEW_TEXT_BYTES + 10);
   await writeFile(join(w.directory, "shots", "long.log"), longLog);
   await writeFile(join(w.directory, "shots", "empty.txt"), "");
   await w.run("deliverable", "add", "Long", "shots/long.log");
   await w.run("deliverable", "add", "Empty", "shots/empty.txt");
-  assert.deepEqual(await previewDeliverable(w.directory, "D6"), {
+  assert.deepEqual(await previewDeliverable(w.dashboardAt, "D6"), {
     kind: "text",
     text: longLog.slice(0, MAX_PREVIEW_TEXT_BYTES),
     bytes: longLog.length,
     truncated: true,
   });
-  assert.deepEqual(await previewDeliverable(w.directory, "D7"), { kind: "text", text: "", bytes: 0, truncated: false });
+  assert.deepEqual(await previewDeliverable(w.dashboardAt, "D7"), { kind: "text", text: "", bytes: 0, truncated: false });
   const line = "a log line ending in é\n";
   const lines = line.repeat(Math.ceil(MAX_PREVIEW_TEXT_BYTES / Buffer.byteLength(line)));
   const exact = "y\n".repeat(MAX_PREVIEW_TEXT_BYTES / 2 - 2) + "zzé";
@@ -1917,10 +1936,10 @@ test("image and text deliverables preview, only inside the worktree", async (t) 
   await writeFile(join(w.directory, "shots", "exact.txt"), exact);
   await w.run("deliverable", "add", "Lines", "shots/lines.log");
   await w.run("deliverable", "add", "Exact", "shots/exact.txt");
-  const cut = await previewDeliverable(w.directory, "D8");
+  const cut = await previewDeliverable(w.dashboardAt, "D8");
   assert.ok(cut.kind === "text" && cut.truncated && cut.text.endsWith(line) && lines.startsWith(cut.text), "a cut log ends after its last whole line");
   assert.deepEqual(
-    await previewDeliverable(w.directory, "D9"),
+    await previewDeliverable(w.dashboardAt, "D9"),
     { kind: "text", text: exact, bytes: MAX_PREVIEW_TEXT_BYTES, truncated: false },
     "a file exactly at the limit comes back whole",
   );
@@ -1933,8 +1952,8 @@ test("an HTML report opens in Paseo's own preview, so Progress neither previews 
   await mkdir(join(w.directory, "report"), { recursive: true });
   await writeFile(join(w.directory, "report", "index.html"), "<h1>Report</h1>");
   await w.run("deliverable", "add", "Report", "report/index.html");
-  await assert.rejects(previewDeliverable(w.directory, "D1"), /report\/index\.html isn't an image, video, PDF or text file/);
-  const report = findAttachment((await readProgress(w.store)).dashboard, "D1")!;
+  await assert.rejects(previewDeliverable(w.dashboardAt, "D1"), /report\/index\.html isn't an image, video, PDF or text file/);
+  const report = findAttachment((await readProgress(w.dashboardAt)).dashboard, "D1")!;
   assert.equal(attachmentIcon(report), "FileCode");
   assert.equal(isPage(report), true, "its row links to the file, which Paseo opens in a tab");
   assert.equal(canPreview(report, { browser: true }), false);
@@ -1955,22 +1974,22 @@ test("a video previews as its type and size, then arrives in pieces", async (t) 
   await w.run("deliverable", "add", "Demo", "clips/demo.MOV");
   await w.run("deliverable", "add", "Huge", "clips/huge.mp4");
   await w.run("deliverable", "add", "Home", "clips/home.png");
-  const { dashboard } = await readProgress(w.store);
+  const { dashboard } = await readProgress(w.dashboardAt);
   const demo = findAttachment(dashboard, "D1")!;
   assert.equal(dashboard.deliverables.find((entry) => entry.title === "Demo")!.kind, "file");
   assert.equal(attachmentIcon(demo), "Video");
   assert.equal(canPreview(demo, { browser: true }), true);
   assert.equal(canPreview(demo, { browser: false }), false, "the phone apps have no video player");
-  assert.deepEqual(await previewDeliverable(w.directory, "D1"), { kind: "video", mimeType: "video/quicktime", bytes: clip.length });
-  const first = await readDeliverablePiece(w.directory, "D1", 0);
-  const second = await readDeliverablePiece(w.directory, "D1", PIECE_BYTES);
+  assert.deepEqual(await previewDeliverable(w.dashboardAt, "D1"), { kind: "video", mimeType: "video/quicktime", bytes: clip.length });
+  const first = await readDeliverablePiece(w.dashboardAt, "D1", 0);
+  const second = await readDeliverablePiece(w.dashboardAt, "D1", PIECE_BYTES);
   assert.equal(first.bytes, clip.length);
   assert.deepEqual(Buffer.concat([Buffer.from(first.data, "base64"), Buffer.from(second.data, "base64")]), clip);
-  assert.deepEqual(await readDeliverablePiece(w.directory, "D1", clip.length), { data: "", bytes: clip.length }, "past the end is empty, not an error");
-  await assert.rejects(previewDeliverable(w.directory, "D2"), /too large to preview/);
-  await assert.rejects(readDeliverablePiece(w.directory, "D2", 0), /too large to preview/);
-  await assert.rejects(readDeliverablePiece(w.directory, "D3", 0), /isn't a video or PDF/, "pieces are only for videos and PDFs");
-  await assert.rejects(readDeliverablePiece(w.directory, "D9", 0), /No local deliverable D9/);
+  assert.deepEqual(await readDeliverablePiece(w.dashboardAt, "D1", clip.length), { data: "", bytes: clip.length }, "past the end is empty, not an error");
+  await assert.rejects(previewDeliverable(w.dashboardAt, "D2"), /too large to preview/);
+  await assert.rejects(readDeliverablePiece(w.dashboardAt, "D2", 0), /too large to preview/);
+  await assert.rejects(readDeliverablePiece(w.dashboardAt, "D3", 0), /isn't a video or PDF/, "pieces are only for videos and PDFs");
+  await assert.rejects(readDeliverablePiece(w.dashboardAt, "D9", 0), /No local deliverable D9/);
 });
 
 test("a PDF previews as its size, then arrives in pieces, in a browser only", async (t) => {
@@ -1986,7 +2005,7 @@ test("a PDF previews as its size, then arrives in pieces, in a browser only", as
   await w.run("deliverable", "add", "Spec", "docs/spec.PDF");
   await w.run("deliverable", "add", "Huge", "docs/huge.pdf");
   await w.run("deliverable", "add", "Notes", "docs/notes.md");
-  const { dashboard } = await readProgress(w.store);
+  const { dashboard } = await readProgress(w.dashboardAt);
   const spec = findAttachment(dashboard, "D1")!;
   assert.equal(attachmentIcon(spec), "BookOpenText");
   assert.notEqual(attachmentIcon(spec), attachmentIcon({ ref: "D9", title: "Clip", path: "clip.mp4" }), "a PDF doesn't look like a video");
@@ -1996,14 +2015,14 @@ test("a PDF previews as its size, then arrives in pieces, in a browser only", as
   assert.equal(opensInTab(spec, { platform: "web" }), true, "desktop gets a bigger view than the dialog");
   assert.equal(opensInTab(spec, { platform: "android" }), false, "Android's viewer can't show a PDF");
   assert.equal(opensInTab(findAttachment(dashboard, "D3")!, { platform: "ios" }), false, "only PDFs get the button");
-  assert.deepEqual(await previewDeliverable(w.directory, "D1"), { kind: "pdf", bytes: pdf.length });
-  const first = await readDeliverablePiece(w.directory, "D1", 0);
-  const second = await readDeliverablePiece(w.directory, "D1", PIECE_BYTES);
+  assert.deepEqual(await previewDeliverable(w.dashboardAt, "D1"), { kind: "pdf", bytes: pdf.length });
+  const first = await readDeliverablePiece(w.dashboardAt, "D1", 0);
+  const second = await readDeliverablePiece(w.dashboardAt, "D1", PIECE_BYTES);
   assert.equal(first.bytes, pdf.length);
   assert.deepEqual(Buffer.concat([Buffer.from(first.data, "base64"), Buffer.from(second.data, "base64")]), pdf);
-  await assert.rejects(previewDeliverable(w.directory, "D2"), /too large to preview/);
-  await assert.rejects(readDeliverablePiece(w.directory, "D2", 0), /too large to preview/);
-  await assert.rejects(readDeliverablePiece(w.directory, "D3", 0), /isn't a video or PDF/, "a Markdown file doesn't come in pieces");
+  await assert.rejects(previewDeliverable(w.dashboardAt, "D2"), /too large to preview/);
+  await assert.rejects(readDeliverablePiece(w.dashboardAt, "D2", 0), /too large to preview/);
+  await assert.rejects(readDeliverablePiece(w.dashboardAt, "D3", 0), /isn't a video or PDF/, "a Markdown file doesn't come in pieces");
 });
 
 test("question attachments take paths or links, and open and preview like deliverables", async (t) => {
@@ -2029,7 +2048,7 @@ test("question attachments take paths or links, and open and preview like delive
     "--file",
     "https://example.com/?q=1",
   );
-  const { dashboard } = await readProgress(w.store);
+  const { dashboard } = await readProgress(w.dashboardAt);
   assert.deepEqual(
     dashboard.questions.open[0].files,
     [
@@ -2042,18 +2061,18 @@ test("question attachments take paths or links, and open and preview like delive
   assert.equal(findAttachment(dashboard, "Q1.1")?.path, "shots/before.png");
   assert.equal(findAttachment(dashboard, "Q1.2")?.path, undefined, "links are not opened on the host");
   assert.equal(findAttachment(dashboard, "Q1.4"), null);
-  assert.deepEqual(await previewDeliverable(w.directory, "Q1.1"), {
+  assert.deepEqual(await previewDeliverable(w.dashboardAt, "Q1.1"), {
     kind: "image",
     dataUri: `data:image/png;base64,${png.toString("base64")}`,
     bytes: png.length,
   });
   const opened: string[] = [];
-  await openDeliverable(w.directory, "Q1.1", async (path) => {
+  await openDeliverable(w.dashboardAt, "Q1.1", async (path) => {
     opened.push(path);
   });
   assert.deepEqual(opened, [join(await realpath(w.directory), "shots", "before.png")]);
   await assert.rejects(
-    openDeliverable(w.directory, "Q1.9", async () => {}),
+    openDeliverable(w.dashboardAt, "Q1.9", async () => {}),
     /No local attachment Q1\.9/,
   );
   const ftp = await w.run("question", "update", "Q1", "--file", "ftp://example.com/x");
@@ -2068,68 +2087,108 @@ test("plain-text deliverables open in the default browser; pictures, video, audi
   assert.deepEqual(openCommand("/w/spec.md", "linux", null), ["xdg-open", ["/w/spec.md"]]);
 });
 
-test("the skill is linked for every agent only on request, follows the copy Paseo runs, and never replaces another file", async (t) => {
+test("Install skill copies the skill for every agent, updates only its own copies, and never replaces another file", async (t) => {
   const home = await mkdtemp(join(tmpdir(), "progress-skill-"));
   t.after(() => rm(home, { recursive: true, force: true }));
   const paths = defaultSkillPaths(home);
   assert.deepEqual(
     paths.map((path) => path.slice(home.length)),
-    ["/.agents/skills/paseo-progress", "/.claude/skills/paseo-progress", "/.codex/skills/paseo-progress"],
+    ["/.agents/skills/paseo-progress", "/.claude/skills/paseo-progress", "/.gemini/config/skills/paseo-progress"],
   );
-  const plugin = join(home, "plugin");
-  assert.equal((await skillStatus(paths, plugin)).state, "missing");
+  assert.equal((await skillStatus(paths, "v1")).state, "missing");
+  await mkdir(paths[1], { recursive: true });
   await mkdir(paths[2], { recursive: true });
-  assert.equal(await installSkill(paths, plugin), true);
-  assert.equal(await readlink(paths[0]), skillSource(plugin));
-  assert.equal(await readlink(paths[1]), skillSource(plugin));
-  assert.deepEqual(
-    await skillStatus(paths, plugin),
-    {
-      state: "current",
-      targets: [
-        { path: paths[0], state: "current" },
-        { path: paths[1], state: "current" },
-        { path: paths[2], state: "foreign" },
-      ],
-    },
-    "someone else's skill folder is left alone",
-  );
-  assert.equal(await installSkill(paths, plugin), false, "current links are left as is");
-  const moved = join(home, "other-checkout");
-  assert.equal((await skillStatus(paths, moved)).state, "outdated", "Paseo now runs another copy");
-  assert.equal(await installSkill(paths, moved), true);
-  assert.equal(await readlink(paths[1]), skillSource(moved));
-  await assert.rejects(installSkill([paths[2]], plugin), /were not linked by this plugin/);
+  await writeFile(join(paths[2], "SKILL.md"), "mine");
+  assert.equal(await syncSkill(paths, "v1", "install"), true);
+  for (const path of paths.slice(0, 2)) {
+    assert.equal((await lstat(path)).isDirectory(), true, `${path} is a plain folder, not a link`);
+    assert.equal(await readFile(join(path, "SKILL.md"), "utf8"), "v1", "a missing path and an empty folder both get the copy");
+  }
+  assert.equal(await readFile(join(paths[2], "SKILL.md"), "utf8"), "mine", "a folder without the marker is someone else's");
+  assert.deepEqual(await skillStatus(paths, "v1"), {
+    state: "current",
+    targets: [
+      { path: paths[0], state: "current" },
+      { path: paths[1], state: "current" },
+      { path: paths[2], state: "foreign" },
+    ],
+  });
+  assert.equal(await syncSkill(paths, "v1", "install"), false, "current copies are left as is");
+  assert.equal(await syncSkill(paths, "v1", "update"), false, "a plugin update that keeps SKILL.md writes nothing");
+  assert.equal((await skillStatus(paths, "v2")).state, "outdated", "the plugin's SKILL.md changed");
+  assert.equal(await syncSkill(paths, "v2", "update"), true);
+  assert.equal(await readFile(join(paths[0], "SKILL.md"), "utf8"), "v2");
+  assert.equal(await readFile(join(paths[2], "SKILL.md"), "utf8"), "mine");
+  await assert.rejects(syncSkill([paths[2]], "v2", "install"), /were not installed by this plugin/);
+  const elsewhere = join(home, "other", "skills", "paseo-progress");
+  await mkdir(dirname(elsewhere), { recursive: true });
+  await symlink(join(home, "some-folder"), elsewhere, "junction");
+  assert.equal((await skillStatus([elsewhere], "v2")).state, "foreign", "a link this plugin didn't make");
 });
 
-test("after an update, links the user made follow the new copy without touching anything else", async (t) => {
+test("on load, links from earlier versions become copies, a missing copy waits for Install skill, and the old Codex link goes", async (t) => {
   const home = await mkdtemp(join(tmpdir(), "progress-skill-"));
   t.after(() => rm(home, { recursive: true, force: true }));
-  const [linked, other, missing] = defaultSkillPaths(home);
-  const paths = [linked, other, missing];
-  await installSkill([linked], join(home, "old-copy"));
-  await mkdir(other, { recursive: true });
-  const updated = join(home, "new-copy");
-  assert.equal((await skillStatus(paths, updated)).state, "outdated");
-  assert.equal(await relinkSkill(paths, updated), true);
-  assert.equal(await readlink(linked), skillSource(updated));
+  const paths = defaultSkillPaths(home);
+  const [agents, claude] = paths;
+  const [codex] = retiredSkillPaths(home);
+  const running = join(home, "new-copy");
+  const old = join(home, "old-copy");
+  for (const [plugin, text] of [
+    [running, "v2"],
+    [old, "v1"],
+  ]) {
+    await mkdir(skillSource(plugin), { recursive: true });
+    await writeFile(join(skillSource(plugin), "SKILL.md"), text);
+  }
+  for (const [path, plugin] of [
+    [agents, running],
+    [claude, old],
+    [codex, old],
+  ]) {
+    await mkdir(dirname(path), { recursive: true });
+    await symlink(skillSource(plugin), path, "junction");
+  }
   assert.deepEqual(
-    (await skillStatus(paths, updated)).targets,
-    [
-      { path: linked, state: "current" },
-      { path: other, state: "foreign" },
-      { path: missing, state: "missing" },
-    ],
-    "someone else's folder stays, and no new link is made without Install skill",
+    (await skillStatus(paths, "v2")).targets.map((target) => target.state),
+    ["outdated", "outdated", "missing"],
+    "every link from before copies is outdated, even one to the copy Paseo runs",
   );
-  assert.equal(await relinkSkill(paths, updated), false, "a second run finds nothing to do");
-  assert.equal(await readlink(linked), skillSource(updated));
+  assert.equal(await syncSkill(paths, "v2", "update"), true);
+  for (const path of [agents, claude]) {
+    assert.equal((await lstat(path)).isSymbolicLink(), false, `${path} is a copy now`);
+    assert.equal(await readFile(join(path, "SKILL.md"), "utf8"), "v2");
+  }
+  assert.equal(await readFile(join(skillSource(old), "SKILL.md"), "utf8"), "v1", "nothing is written through an old link");
+  assert.deepEqual(await readdir(skillSource(running)), ["SKILL.md"], "the plugin's own folder is untouched");
+  assert.deepEqual(
+    (await skillStatus(paths, "v2")).targets.map((target) => target.state),
+    ["current", "current", "missing"],
+    "no new copy is made without Install skill",
+  );
+  assert.equal(await syncSkill(paths, "v2", "update"), false, "a second run finds nothing to do");
+  await rm(join(claude, "SKILL.md"));
+  assert.equal((await skillStatus(paths, "v2")).state, "outdated", "a copy a crash left without SKILL.md");
+  assert.equal(await syncSkill(paths, "v2", "update"), true);
+  assert.equal(await readFile(join(claude, "SKILL.md"), "utf8"), "v2");
+
+  assert.equal(await retireSkill([codex]), true);
+  await assert.rejects(lstat(codex), { code: "ENOENT" });
+  await mkdir(codex);
+  await writeFile(join(codex, "SKILL.md"), "mine");
+  assert.equal(await retireSkill([codex]), false);
+  assert.equal(await readFile(join(codex, "SKILL.md"), "utf8"), "mine", "a real folder in ~/.codex/skills is left alone");
 });
 
 test("Settings shows the skill as agents read it, without its frontmatter", async () => {
   const shipped = skillDocument(await readFile(join(skillSource(fileURLToPath(new URL("..", import.meta.url))), "SKILL.md"), "utf8"));
   assert.match(shipped.description, /^Keep the Paseo Progress dashboard live/);
   assert.match(shipped.markdown, /^# Paseo progress\n/);
+  assert.deepEqual(
+    await readdir(skillSource(fileURLToPath(new URL("..", import.meta.url)))),
+    ["SKILL.md"],
+    "installs copy SKILL.md alone, so a second file needs skill.ts to copy it too",
+  );
   assert.deepEqual(skillDocument('---\r\nname: x\r\ndescription: "Quoted: yes"\r\n---\r\n\nBody'), { markdown: "Body", description: "Quoted: yes" });
   assert.deepEqual(skillDocument("# No frontmatter"), { markdown: "# No frontmatter", description: "" });
 });
@@ -2146,7 +2205,7 @@ async function newRepo(t: TestContext) {
     linked,
     async run(cwd: string, ...argv: string[]) {
       output.length = 0;
-      const code = await runCli(argv, { cwd, now: () => minutes(0), out: (line) => output.push(line) });
+      const code = await runCli(argv, { workspace: null, cwd, now: () => minutes(0), out: (line) => output.push(line) });
       return { code, text: output.join("\n") };
     },
     // What `git status` lists, one path per line.
@@ -2193,8 +2252,8 @@ test("progress lives outside the repo: no setup, nothing for git to see", async 
 test("outside git it works the same", async (t) => {
   const directory = await realpath(await mkdtemp(join(tmpdir(), "progress-nogit-")));
   t.after(() => rm(directory, { recursive: true, force: true }));
-  assert.equal(await runCli(["start", "Run"], { cwd: directory, now: () => minutes(0), out: () => {} }), 0);
-  assert.equal((await findStore(directory)).directory, outsideDirectory(directory));
+  assert.equal(await runCli(["start", "Run"], { workspace: null, cwd: directory, now: () => minutes(0), out: () => {} }), 0);
+  assert.deepEqual(await readdir(outsideDirectory(directory)), ["progress.jsonl"]);
   assert.deepEqual(await readdir(directory), []);
   const result = await handleGetDashboard({ workspaceId: "ws-1", workspaceDirectory: directory }, context);
   assert.ok("dashboard" in result);

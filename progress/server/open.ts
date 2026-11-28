@@ -17,8 +17,7 @@ import {
 } from "../shared/attachments.ts";
 import { prepareMarkdown, previewText } from "../shared/markdown.ts";
 import { readProgress } from "./progress-file.ts";
-import { findRoot, outside } from "./paths.ts";
-import { findStore } from "./store.ts";
+import { type DashboardAt, outside, panelDashboardAt } from "./paths.ts";
 import { openToRead, runProgram } from "./system.ts";
 
 export type Opener = (path: string) => Promise<void>;
@@ -61,13 +60,16 @@ export function hostOpener(platform: NodeJS.Platform, env: NodeJS.ProcessEnv): O
   };
 }
 
+// The panel explains this refusal instead of showing the message, so it's told apart.
+class OutsideWorktree extends Error {}
+
 // A deliverable or question attachment the agent recorded, found by reference,
 // so the panel can never reach an arbitrary path. Only files inside the
 // worktree resolve.
-async function resolveAttachment(directory: string, ref: string, verb: string): Promise<{ path: string; realTarget: string; worktree: string }> {
+async function resolveAttachment(at: DashboardAt, ref: string, verb: string): Promise<{ path: string; realTarget: string; worktree: string }> {
   const { base, inner } = splitRef(ref);
-  const worktree = findRoot(directory);
-  const { dashboard } = await readProgress((await findStore(worktree)).directory);
+  const worktree = at.root;
+  const { dashboard } = await readProgress(at);
   const folder = findAttachment(dashboard, base)?.path;
   if (!folder) throw new Error(`No local ${base.startsWith("Q") ? "attachment" : "deliverable"} ${base} in this worktree.`);
   const path = inner ? join(folder, inner) : folder;
@@ -76,14 +78,14 @@ async function resolveAttachment(directory: string, ref: string, verb: string): 
   const realTarget = await realpath(resolve(realRoot, path)).catch(() => null);
   if (!realTarget) throw new Error(`${path} no longer exists.`);
   const inside = relative(realRoot, realTarget);
-  if (outside(inside)) throw new Error(`${path} is outside this worktree, so it was not ${verb}.`);
+  if (outside(inside)) throw new OutsideWorktree(`${path} is outside this worktree, so it was not ${verb}.`);
   return { path, realTarget, worktree };
 }
 
 // The real file is checked, not the name the agent recorded, so a link named
 // like a picture can't hand a script to the default app.
-export async function openDeliverable(directory: string, id: string, opener: Opener): Promise<{ opened: string }> {
-  const { path, realTarget } = await resolveAttachment(directory, id, "opened");
+export async function openDeliverable(at: DashboardAt, id: string, opener: Opener): Promise<{ opened: string }> {
+  const { path, realTarget } = await resolveAttachment(at, id, "opened");
   if (!(await stat(realTarget)).isFile() || !opensOnHost(realTarget))
     throw new Error(`Progress opens only images, video, audio, PDFs and text files, not ${path}`);
   await opener(realTarget);
@@ -112,10 +114,16 @@ export type Preview =
   | { kind: "pdf"; bytes: number }
   | { kind: "text"; text: string; bytes: number; truncated: boolean }
   | { kind: "markdown"; markdown: string; bytes: number; truncated: boolean }
-  | { kind: "folder"; entries: FolderEntry[]; truncated: boolean };
+  | { kind: "folder"; entries: FolderEntry[]; truncated: boolean }
+  | { kind: "outside" };
 
-export async function previewDeliverable(directory: string, id: string): Promise<Preview> {
-  const { path, realTarget, worktree } = await resolveAttachment(directory, id, "previewed");
+export async function previewDeliverable(at: DashboardAt, id: string): Promise<Preview> {
+  const resolved = await resolveAttachment(at, id, "previewed").catch((error: unknown) => {
+    if (error instanceof OutsideWorktree) return null;
+    throw error;
+  });
+  if (!resolved) return { kind: "outside" };
+  const { path, realTarget, worktree } = resolved;
   const stats = await stat(realTarget);
   if (stats.isDirectory()) return { kind: "folder", ...(await listFolder(realTarget)) };
   // A page opens in Paseo's own preview, in a tab.
@@ -160,8 +168,8 @@ function tooLarge(path: string, size: number): string {
   return `${path} is ${Math.round(size / 1024 / 1024)} MB, too large to preview.`;
 }
 
-export async function readDeliverablePiece(directory: string, id: string, offset: number): Promise<{ data: string; bytes: number }> {
-  const { path, realTarget } = await resolveAttachment(directory, id, "previewed");
+export async function readDeliverablePiece(at: DashboardAt, id: string, offset: number): Promise<{ data: string; bytes: number }> {
+  const { path, realTarget } = await resolveAttachment(at, id, "previewed");
   const kind = previewKind(realTarget);
   if (!isPieced(kind)) throw new Error(`${path} isn't a video or PDF.`);
   const file = await openToRead(realTarget);
@@ -178,18 +186,18 @@ export async function readDeliverablePiece(directory: string, id: string, offset
 }
 
 export async function handlePreviewDeliverable(input: { workspaceId: string; workspaceDirectory: string; ref: string }, _context: PluginHandlerContext) {
-  return previewDeliverable(input.workspaceDirectory, input.ref);
+  return previewDeliverable(panelDashboardAt(input), input.ref);
 }
 
 export async function handleReadDeliverablePiece(
   input: { workspaceId: string; workspaceDirectory: string; ref: string; offset: number },
   _context: PluginHandlerContext,
 ) {
-  return readDeliverablePiece(input.workspaceDirectory, input.ref, input.offset);
+  return readDeliverablePiece(panelDashboardAt(input), input.ref, input.offset);
 }
 
 export async function handleOpenDeliverable(input: { workspaceId: string; workspaceDirectory: string; ref: string }, _context: PluginHandlerContext) {
-  return openDeliverable(input.workspaceDirectory, input.ref, hostOpener(process.platform, process.env));
+  return openDeliverable(panelDashboardAt(input), input.ref, hostOpener(process.platform, process.env));
 }
 
 export async function handleCanOpenOnHost(_input: { workspaceId: string; workspaceDirectory: string }, _context: PluginHandlerContext) {

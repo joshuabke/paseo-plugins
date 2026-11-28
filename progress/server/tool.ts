@@ -3,6 +3,7 @@ import { z } from "zod";
 import { DELIVERABLE_KINDS, ticketStatusSchema } from "../shared/events.ts";
 import type { ToolsState } from "../shared/rpc.ts";
 import { PROGRESS_TOOL_NAMES, type ProgressToolName } from "../shared/tools.ts";
+import { parseWorkspaceId } from "../shared/workspace.ts";
 import { commandSummary, runCli } from "./cli.ts";
 
 // defineAgentTool's typing for a tool named by its key in `tools`. Paseo
@@ -20,7 +21,7 @@ function agentTool<Input extends z.ZodType>(
 
 async function run(args: string[], { agent }: AgentToolContext): Promise<AgentToolResult> {
   const lines: string[] = [];
-  const code = await runCli(args, { cwd: agent.cwd, agentId: agent.id, out: (line) => lines.push(line) });
+  const code = await runCli(args, { cwd: agent.cwd, agentId: agent.id, workspace: parseWorkspaceId(agent.workspaceId), out: (line) => lines.push(line) });
   return { text: lines.join("\n"), isError: code !== 0 };
 }
 
@@ -109,9 +110,27 @@ const tools: Record<ProgressToolName, Tool> = {
       note: z.string().optional(),
       waitsFor: z.string().optional().describe('A ticket this one can\'t start before, like T02; "" clears it'),
       source: z.string().optional().describe('Spec file path or http(s) link where the ticket is written up; "" clears it'),
+      progress: z
+        .union([z.number(), z.string()])
+        .optional()
+        .describe(
+          'Percent done, 0 to 100, like 73, or a count like "26000/36400"; "" clears it. Only for a job that measures its own progress, like a training run; never estimate one for coding work.',
+        ),
+      eta: z
+        .string()
+        .optional()
+        .describe(
+          'When it should be done: time left like "25m" or "1h 20m", a clock time like "16:10", or an ISO time; "" clears it. Only for a job that measures its own progress, like a training run; never estimate one for coding work.',
+        ),
+      detail: z
+        .string()
+        .optional()
+        .describe(
+          'One line about where it is, like "Step 26000/36400"; "" clears it. Only for a job that measures its own progress, like a training run; never estimate one for coding work.',
+        ),
     }),
-    ({ id, status, stage, title, estimateMinutes, note, waitsFor, source }) =>
-      commandArgs("ticket update", [id], { status, stage, title, estimate: estimateMinutes, note, "waits-for": waitsFor, source }),
+    ({ id, status, stage, title, estimateMinutes, note, waitsFor, source, progress, eta, detail }) =>
+      commandArgs("ticket update", [id], { status, stage, title, estimate: estimateMinutes, note, "waits-for": waitsFor, source, progress, eta, detail }),
   ),
   progress_question_ask: withNote(
     commandTool(
